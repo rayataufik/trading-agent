@@ -205,8 +205,9 @@ void DrawRow(const string nm, const int x, const int y, const string txt,
    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, nm, OBJPROP_BACK, false);
-   // Above the panel backdrop (zorder 0). Both would otherwise default to 0 and the
-   // draw order would decide who hides whom - and the box is drawn last.
+   // ZORDER here only affects mouse-click priority in MT5, not what is painted on top.
+   // Render order comes from creation order, which is why DrawPanel creates the backdrop
+   // before the labels.
    ObjectSetInteger(0, nm, OBJPROP_ZORDER, 10);
 
    double w = StringLen(txt) * size * 0.62;
@@ -259,20 +260,41 @@ void DrawHLine(const string nm, const int shift1, const int shift2, const double
 void DrawPanelBackdrop(const int x, const int y, const int rows, const int dy);
 
 //------------------------------------------------------------------//
+//  DrawPanel builds the whole panel as a list of rows first, then paints the
+//  backdrop, then paints the text. That order is not cosmetic: MT5 renders
+//  foreground objects in creation order, and OBJPROP_ZORDER only decides which
+//  object receives a mouse click - it does NOT bring a label in front of a
+//  rectangle. Drawing the box last therefore hid every row behind it, which is
+//  exactly what happened when InpPanelBackdrop was turned on.
+//------------------------------------------------------------------//
+//------------------------------------------------------------------//
+//  Delete every object the panel owns. Called before each rebuild so creation
+//  order is always: backdrop first, then rows. MT5 paints foreground objects in
+//  creation order, so only a clean rebuild guarantees the box stays behind the text.
+//------------------------------------------------------------------//
+void WipePanelObjects(void)
+{
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string nm = ObjectName(0, i);
+      if(StringFind(nm, PFX "p_") == 0)
+         ObjectDelete(0, nm);
+   }
+}
+
 void DrawPanel(void)
 {
    if(!InpShowPanel)
    {
       // Remove everything the panel owns, including the backdrop. Deleting only
       // "panel" (a name no object ever uses) left the whole panel on screen.
-      for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
-      {
-         string nm = ObjectName(0, i);
-         if(StringFind(nm, PFX "p_") == 0)
-            ObjectDelete(0, nm);
-      }
+      WipePanelObjects();
       return;
    }
+
+   // Rebuild from scratch, in order. Reusing label objects keeps their original
+   // creation order, and any order other than "box, then text" hides the panel.
+   WipePanelObjects();
 
    SAILensOut o = g_core.Out();
    SAILensTrade t = g_core.Trade();
@@ -286,61 +308,75 @@ void DrawPanel(void)
    if(dpi < 96) dpi = 96;
    int dy = (int)MathRound((double)InpPanelRowPx * dpi / 96.0);
    if(dy < 8) dy = 8;
-   g_panelW = 0.0;
+
    color cVal = clrWhiteSmoke;
    color cBull = C'0,230,118', cBear = C'255,82,82', cCy = C'0,229,255', cWarn = C'255,215,64';
 
    string lead = (t.side == 1 ? "LONG" : (t.side == -1 ? "SHORT" : "WAIT"));
    color  leadC = (t.side == 1 ? cBull : (t.side == -1 ? cBear : cVal));
 
-   int line = 0;
-   DrawRow(PFX "p_title", x, y + dy * line++, "AI AGENT LENS +  " + _Symbol + " " + TfStr((ENUM_TIMEFRAMES)Period()), cCy, 9);
-   DrawRow(PFX "p_hero",  x, y + dy * line++, lead + "   " + IntegerToString(t.side == 1 ? o.longScore : (t.side == -1 ? o.shortScore : 0)), leadC, 12);
-   // The hero row is drawn at 12pt while every other row is 8pt, so it needs roughly
-   // 1.5x the pitch. Without this extra slot its descenders land on the Regime row -
-   // which is exactly the overlap visible in the panel.
-   line++;
+   // Row list. `slots` is how many row-pitches the row occupies: the 12pt hero needs
+   // two, otherwise its descenders land on the Regime row.
+   string nm[16], tx[16];
+   color  cl[16];
+   int    sz[16], slots[16];
+   int    n = 0;
 
-   DrawRow(PFX "p_regime", x, y + dy * line++, "Regime      " + o.regime, cVal, 8);
-   DrawRow(PFX "p_sess",   x, y + dy * line++, "Session     " + o.sesLabel + (o.inSession ? "" : " (blocked)"),
-            (o.inSession ? cCy : cWarn), 8);
-   DrawRow(PFX "p_scores", x, y + dy * line++, "Long/Short  " + IntegerToString(o.longScore) + " / " + IntegerToString(o.shortScore),
-            (o.longScore > o.shortScore ? cBull : (o.shortScore > o.longScore ? cBear : cVal)), 8);
+   nm[n]=PFX "p_title";  tx[n]="AI AGENT LENS +  " + _Symbol + " " + TfStr((ENUM_TIMEFRAMES)Period()); cl[n]=cCy;  sz[n]=9;  slots[n]=1; n++;
+   nm[n]=PFX "p_hero";   tx[n]=lead + "   " + IntegerToString(t.side == 1 ? o.longScore : (t.side == -1 ? o.shortScore : 0)); cl[n]=leadC; sz[n]=12; slots[n]=2; n++;
+   nm[n]=PFX "p_regime"; tx[n]="Regime      " + o.regime;                             cl[n]=cVal;  sz[n]=8; slots[n]=1; n++;
+   nm[n]=PFX "p_sess";   tx[n]="Session     " + o.sesLabel + (o.inSession ? "" : " (blocked)"); cl[n]=(o.inSession ? cCy : cWarn); sz[n]=8; slots[n]=1; n++;
+   nm[n]=PFX "p_scores"; tx[n]="Long/Short  " + IntegerToString(o.longScore) + " / " + IntegerToString(o.shortScore);
+                         cl[n]=(o.longScore > o.shortScore ? cBull : (o.shortScore > o.longScore ? cBear : cVal)); sz[n]=8; slots[n]=1; n++;
 
    int aligned = (o.longScore >= o.shortScore
                   ? (o.lTrend >= 12) + (o.lMom >= 12) + (o.lStr >= 12) + (o.lVol >= 12) + (o.lHtf >= 12)
                   : (o.sTrend >= 12) + (o.sMom >= 12) + (o.sStr >= 12) + (o.sVol >= 12) + (o.sHtf >= 12));
-   DrawRow(PFX "p_conf", x, y + dy * line++,
-            "Confluence  " + IntegerToString(aligned) + " of " + IntegerToString(o.activeFactors) + " aligned",
-            (aligned >= o.activeFactors - 1 ? cBull : cVal), 8);
+   nm[n]=PFX "p_conf";   tx[n]="Confluence  " + IntegerToString(aligned) + " of " + IntegerToString(o.activeFactors) + " aligned";
+                         cl[n]=(aligned >= o.activeFactors - 1 ? cBull : cVal); sz[n]=8; slots[n]=1; n++;
 
    if(t.side == 0)
    {
-      // Flat: remove the trade rows. Without this they stay on screen forever after
-      // the first trade closes, showing stale prices as if a position were still open.
-      ObjectDelete(0, PFX "p_entry");
-      ObjectDelete(0, PFX "p_stop");
-      ObjectDelete(0, PFX "p_tgts");
-      ObjectDelete(0, PFX "p_openr");
+      // Flat: no trade rows. They cannot linger, because every DrawPanel rebuild starts
+      // from a clean slate (WipePanelObjects) rather than reusing objects.
    }
    else
    {
-      DrawRow(PFX "p_entry", x, y + dy * line++, "Entry       " + DoubleToString(t.entry, _Digits), cVal, 8);
-      DrawRow(PFX "p_stop",  x, y + dy * line++, "Stop        " + DoubleToString(t.stop, _Digits) + (t.beMoved ? "  (BE)" : ""), cBear, 8);
-      DrawRow(PFX "p_tgts",  x, y + dy * line++, "Targets     " + DoubleToString(t.t1, _Digits) + " / " + DoubleToString(t.t2, _Digits), cBull, 8);
+      nm[n]=PFX "p_entry"; tx[n]="Entry       " + DoubleToString(t.entry, _Digits); cl[n]=cVal; sz[n]=8; slots[n]=1; n++;
+      nm[n]=PFX "p_stop";  tx[n]="Stop        " + DoubleToString(t.stop, _Digits) + (t.beMoved ? "  (BE)" : ""); cl[n]=cBear; sz[n]=8; slots[n]=1; n++;
+      nm[n]=PFX "p_tgts";  tx[n]="Targets     " + DoubleToString(t.t1, _Digits) + " / " + DoubleToString(t.t2, _Digits); cl[n]=cBull; sz[n]=8; slots[n]=1; n++;
       string rTxt = (o.openR == EMPTY_VALUE ? "n/a" : (o.openR >= 0 ? "+" : "") + DoubleToString(o.openR, 2) + "R");
-      DrawRow(PFX "p_openr", x, y + dy * line++, "Open P&L    " + rTxt, (o.openR >= 0 ? cBull : cBear), 8);
+      nm[n]=PFX "p_openr"; tx[n]="Open P&L    " + rTxt; cl[n]=(o.openR >= 0 ? cBull : cBear); sz[n]=8; slots[n]=1; n++;
    }
 
    // EMPTY_VALUE is DBL_MAX: printing it raw shows 1.797e308. Format through a guard.
    string rsiTxt = (o.rsiV == EMPTY_VALUE ? "--" : DoubleToString(o.rsiV, 0));
    string adxTxt = (o.adxV == EMPTY_VALUE ? "--" : DoubleToString(o.adxV, 0));
-   DrawRow(PFX "p_ctx", x, y + dy * line++,
-            "HTF " + o.htfBiasStr + "   RSI " + rsiTxt + "   ADX " + adxTxt, cVal, 8);
-   DrawRow(PFX "p_struct", x, y + dy * line++, "Structure   " + o.structBias + (o.structEvent == "NONE" ? "" : "  " + o.structEvent),
-            (o.structBias == "BULLISH" ? cBull : (o.structBias == "BEARISH" ? cBear : cVal)), 8);
+   nm[n]=PFX "p_ctx";    tx[n]="HTF " + o.htfBiasStr + "   RSI " + rsiTxt + "   ADX " + adxTxt; cl[n]=cVal; sz[n]=8; slots[n]=1; n++;
+   nm[n]=PFX "p_struct"; tx[n]="Structure   " + o.structBias + (o.structEvent == "NONE" ? "" : "  " + o.structEvent);
+                         cl[n]=(o.structBias == "BULLISH" ? cBull : (o.structBias == "BEARISH" ? cBear : cVal)); sz[n]=8; slots[n]=1; n++;
 
-   DrawPanelBackdrop(x, y, line, dy);
+   // Pass 1: total height in row-pitches, and the widest row for the backdrop.
+   g_panelW = 0.0;
+   int rows = 0;
+   for(int i = 0; i < n; i++)
+   {
+      rows += slots[i];
+      double w = StringLen(tx[i]) * sz[i] * 0.62;
+      if(w > g_panelW)
+         g_panelW = w;
+   }
+
+   // Pass 2: the box. Painted BEFORE the labels so it cannot cover them.
+   DrawPanelBackdrop(x, y, rows, dy);
+
+   // Pass 3: the text.
+   int line = 0;
+   for(int i = 0; i < n; i++)
+   {
+      DrawRow(nm[i], x, y + dy * line, tx[i], cl[i], sz[i]);
+      line += slots[i];
+   }
 }
 
 //------------------------------------------------------------------//
@@ -364,8 +400,14 @@ void DrawPanelBackdrop(const int x, const int y, const int rows, const int dy)
    int boxW = (int)MathCeil(g_panelW) + padX * 2;
    int boxH = rows * dy + padY * 2;
 
-   if(ObjectFind(0, PFX "p_bg") < 0)
-      ObjectCreate(0, PFX "p_bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   // Recreate the box on every draw instead of reusing it. MT5 paints foreground
+   // objects in creation order, so a reused box keeps whatever order it was first
+   // created in - and after toggling InpPanelBackdrop off and on again, that order is
+   // "after the labels", which puts it straight back over the text. Delete + create
+   // makes the order deterministic: the box is always created before the labels that
+   // DrawPanel draws next. It is one object, on a path that only runs on a new bar.
+   ObjectDelete(0, PFX "p_bg");
+   ObjectCreate(0, PFX "p_bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
 
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_CORNER,      CORNER_LEFT_UPPER);
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_XDISTANCE,   x - padX);
@@ -376,8 +418,11 @@ void DrawPanelBackdrop(const int x, const int y, const int rows, const int dy)
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_COLOR,       C'45,55,70');
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_WIDTH,       1);
-   // Z-order, not OBJPROP_BACK: a BACK object can be hidden by the chart's own grid,
-   // while z-order reliably puts this box behind the rows drawn after it.
+   // BACK=false keeps the box in the foreground layer, where it is painted in creation
+   // order relative to the labels: created first, so painted first, so behind the text.
+   // Setting it to true would push the box behind the price chart entirely and it would
+   // vanish. ZORDER is mouse-click priority only and does not decide what covers what.
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_BACK,        false);
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_ZORDER,      0);
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_SELECTABLE,  false);
    ObjectSetInteger(0, PFX "p_bg", OBJPROP_HIDDEN,      true);
