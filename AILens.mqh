@@ -182,6 +182,145 @@ int AILens_MinsSinceOpen(int h, int m, int s)
    return (d < 0 ? d + 1440 : d);
 }
 
+//------------------------------------------------------------------//
+// Broker -> session-clock offset, in hours.                        //
+//                                                                  //
+// The session windows in the config are written in UTC (that is     //
+// what Pine reads), but every timestamp MQL5 hands us is BROKER     //
+// time. The gap is a whole number of hours in practice, and it is   //
+// not constant: a UTC+2 server is usually EET, which becomes UTC+3  //
+// when Europe switches to summer time. Hardcoding -2 would shift    //
+// every session by an hour for half the year, silently.             //
+//                                                                  //
+// So derive it: session hour = broker hour + offset, and we want    //
+// that to be the UTC hour, which makes offset = UTC - broker.       //
+//                                                                  //
+// `manualHours` is the fallback for when the terminal cannot be     //
+// trusted: TimeGMT() is built from the LOCAL PC clock and its       //
+// timezone, so a machine set to the wrong timezone (or the          //
+// Strategy Tester, where the two are simulated) can report a        //
+// nonsense gap. An implausible result falls back rather than        //
+// silently mis-shifting the sessions.                              //
+//                                                                  //
+// Limitation: the result is whole hours. A broker on a half-hour    //
+// offset (India UTC+5:30, parts of Australia) rounds to the nearest //
+// hour, so its sessions would start up to 30 minutes off. The       //
+// windows themselves are whole hours, so that is the smallest error //
+// this design can carry; no such broker is in use here.            //
+//------------------------------------------------------------------//
+int AILens_ServerToUtcOffsetHours(const int manualHours)
+{
+   datetime srv = TimeTradeServer();
+   datetime utc = TimeGMT();
+   if(srv <= 0 || utc <= 0)
+      return manualHours;
+
+   // Broker leads UTC by (srv - utc); we need the opposite sign to walk back to UTC.
+   long diffSec = (long)srv - (long)utc;
+
+   // Round to the nearest hour. The symmetric nudge matters because C integer division
+   // truncates toward zero, which would turn -1.5h into -1h instead of -2h.
+   long k = (diffSec + (diffSec >= 0 ? 1800 : -1800)) / 3600;
+
+   // A real server clock is within a day of UTC. Anything else means the PC clock or
+   // its timezone is wrong, so prefer the explicit value the user typed.
+   if(k < -14 || k > 14)
+      return manualHours;
+
+   return (int)(-k);
+}
+
+// "+2" / "-3" / "0", for logs only. A bare "2" next to the word "broker" reads as
+// ambiguous, and the sign is the part that matters.
+string AILens_SignedHours(const int hours)
+{
+   if(hours > 0)
+      return "+" + IntegerToString(hours);
+   return IntegerToString(hours);
+}
+
+// "09:30" / "24:00". Plain integer math rather than TimeToString so a close of 86400
+// prints as 24:00 instead of wrapping to 00:00 (which would read as a zero-length day).
+string AILens_Hhmm(const int seconds)
+{
+   int totalMin = seconds / 60;
+   return StringFormat("%02d:%02d", totalMin / 60, totalMin % 60);
+}
+
+string AILens_DayName(const int dow)
+{
+   switch(dow)
+   {
+      case MONDAY:    return "Mon";
+      case TUESDAY:   return "Tue";
+      case WEDNESDAY: return "Wed";
+      case THURSDAY:  return "Thu";
+      case FRIDAY:    return "Fri";
+      case SATURDAY:  return "Sat";
+      case SUNDAY:    return "Sun";
+   }
+   return "?";
+}
+
+//------------------------------------------------------------------//
+// Broker's real market hours for one weekday, in SECONDS from midnight BROKER time.
+//                                                                  //
+// The weekend was hardcoded as "Saturday/Sunday", which is wrong for     //
+// a broker that opens Sunday evening, and for index CFDs whose week      //
+// really ends Friday afternoon. MT5 already knows the truth per        //
+// symbol, so read it instead of assuming: SymbolInfoSessionQuote()      //
+// returns the quoting sessions of a symbol for a given weekday.        //
+//                                                                  //
+// A symbol can have several sessions in a day (a lunch break, for      //
+// example), so this scans a few indices and keeps the outermost        //
+// open/close. Sessions that run past midnight are reported with        //
+// `to <= from` and are normalised here by adding a day to the close.   //
+//                                                                  //
+// Returns false when the symbol publishes no hours at all (some         //
+// brokers leave the field empty); the caller then treats the market    //
+// as always open rather than silently blocking every setup.            //
+//------------------------------------------------------------------//
+bool AILens_MarketHours(const string symbol, const int dayOfWeek,
+                        int &openSec, int &closeSec)
+{
+   openSec  = 0;
+   closeSec = 0;
+   bool any = false;
+
+   for(uint idx = 0; idx < 10; idx++)          // MT5 allows several sessions per day
+   {
+      datetime from = 0, to = 0;
+      if(!SymbolInfoSessionQuote(symbol, (ENUM_DAY_OF_WEEK)dayOfWeek, idx, from, to))
+         break;                                // no more sessions for this weekday
+
+      MqlDateTime df, dt;
+      TimeToStruct(from, df);
+      TimeToStruct(to,   dt);
+
+      int o = df.hour * 3600 + df.min * 60;
+      int c = dt.hour * 3600 + dt.min * 60;
+
+      // `to` is exclusive; a 00:00 close means "until midnight", not "zero length".
+      if(c == 0 && o > 0)
+         c = 86400;
+      if(c <= o)                                // runs past midnight
+         c += 86400;
+
+      if(!any)
+      {
+         openSec = o;  closeSec = c;
+         any = true;
+      }
+      else
+      {
+         if(o < openSec)   openSec  = o;
+         if(c > closeSec)  closeSec = c;
+      }
+   }
+
+   return any;
+}
+
 //==================================================================//
 //  CORE ENGINE                                                     //
 //==================================================================//
@@ -229,6 +368,23 @@ private:
    datetime     m_formingTime;   // time of the bar still forming, i.e. m_time[0]
    string       m_lastError;     // why the last load failed; "" when it succeeded
    uint         m_lastLoadAttempt; // GetTickCount() of the last LoadSeries attempt
+   int          m_tzOffsetUsed;  // effective broker->UTC hours, resolved once in Init
+
+   // Session gate, resolved once per Init so the "filter off" decision lives in one place
+   // instead of being re-derived inside the per-bar path.
+   bool m_gateUseSessions;
+   int  m_gateSesBufferMin;
+   int  m_gateFriLateHours;
+   int  m_friLateFromSec;        // Friday cut-off in seconds of BROKER time
+
+   // Market calendar, snapshotted per weekday at Init (broker hours do not change per bar).
+   // m_mktPublished distinguishes "this symbol publishes a calendar" from "the broker left
+   // the field empty": a weekday with no session is CLOSED, but a symbol with no calendar
+   // at all must not be treated as permanently shut.
+   bool m_mktPublished;
+   bool m_mktHas[7];
+   int  m_mktOpenSec[7];
+   int  m_mktCloseSec[7];
 
    // ---- internals ----
    bool  LoadSeries(const int want);
@@ -246,6 +402,7 @@ private:
    int   ScoreAt(const int shift, const int side, int &fTrend, int &fMom,
                  int &fStr, int &fVol, int &fHtf) const;
    bool  SessionOk(const datetime t, bool &inSession, string &label) const;
+   void  InitSessionGate(void);
    void  FillHtfBias(const int shift, bool &valid, int &bias) const;
    void  BuildHtfArrays(void);
    int   ShiftOfTime(const datetime t) const;
@@ -282,6 +439,13 @@ public:
    // Human-readable reason the last LoadSeries/Warmup failed, for logs and the
    // on-chart waiting label. Empty string when the last attempt succeeded.
    string            LastError(void) const { return m_lastError; }
+   // Effective broker->session-clock offset actually in use, after auto-detection.
+   // Logged at startup so a shifted session can never be silent.
+   int               TzOffsetUsed(void) const { return m_tzOffsetUsed; }
+   int               TzOffsetRequested(void) const { return m_cfg.sesTzOffsetHours; }
+   // Market calendar actually read from the broker, for the startup log. Empty when the
+   // symbol publishes no hours, which is itself worth seeing.
+   string            MarketHoursSummary(void) const;
    double            AtrAt(const int shift) const
                      { return (shift >= 0 && shift < m_n ? m_atr[shift] : EMPTY_VALUE); }
    double            CloseAt(const int shift) const
@@ -303,6 +467,21 @@ CAILensCore::CAILensCore(void)
    m_lastBarTime = 0;
    m_lastError = "";
    m_lastLoadAttempt = 0;
+   // 0 until Init() resolves it. A constructor runs before the terminal is guaranteed to be
+   // available, so TimeTradeServer()/TimeGMT() are not trustworthy here.
+   m_tzOffsetUsed = 0;
+   // Same reasoning: the market-hours lookup needs a live terminal, so resolve in Init().
+   m_gateUseSessions  = true;
+   m_gateSesBufferMin = 15;
+   m_gateFriLateHours = 0;
+   m_friLateFromSec   = -1;
+   m_mktPublished     = false;
+   for(int i = 0; i < 7; i++)
+   {
+      m_mktHas[i]      = false;
+      m_mktOpenSec[i]  = 0;
+      m_mktCloseSec[i] = 0;
+   }
 
    m_trade.side = 0;
    m_trade.status = "NONE";
@@ -371,6 +550,16 @@ bool CAILensCore::Init(const SAILensConfig &cfg, const string symbol,
    m_cfg    = cfg;
    m_symbol = (symbol == "" ? _Symbol : symbol);
    m_tf     = tf;
+
+   // Resolve the broker->UTC session offset ONCE, here, rather than in the constructor or
+   // in every SessionOk call. Two reasons: TimeTradeServer() only means anything while the
+   // terminal is up (a global object can be constructed earlier), and recomputing it on
+   // every bar in the tester would be pointless work for a value that changes twice a year.
+   m_tzOffsetUsed = AILens_ServerToUtcOffsetHours(m_cfg.sesTzOffsetHours);
+
+   // Resolve the session gate here, where the symbol is known and the terminal is up.
+   // It needs the broker's published market hours, which are unavailable at construction.
+   InitSessionGate();
 
    // State from the previous timeframe must not survive: the bars changed, so every
    // stored shift, price and trade reference is meaningless now. ResetState() clears the
@@ -782,39 +971,130 @@ void CAILensCore::ComputePivots(const int shift)
 }
 
 //------------------------------------------------------------------//
-//  Session gate. Broker time + offset = session clock.             //
+// Session gate.                                                   //
+//                                                                  //
+// Two independent things live here, and the "time filter off"      //
+// switch must only ever affect the first one:                      //
+//                                                                  //
+//   1. the London/NY/Asia windows you chose to trade               //
+//   2. the market's own calendar: a weekend close, and the last     //
+//      hours of Friday before a weekend gap                        //
+//                                                                  //
+// (2) is not a preference - it is a fact about where price can      //
+// gap - so it stays on even when you turn the windows off. Turning  //
+// the filter off means "any hour the market is open", not "also     //
+// trade a market that is shut".                                    //
+//                                                                  //
+// Both the returned flag and the label describe the GATE, never the //
+// raw clock: reporting the clock while the engine was deliberately  //
+// allowing setups made the panel read "Session OFF (blocked)" in    //
+// orange next to a live entry.                                     //
+//------------------------------------------------------------------//
+void CAILensCore::InitSessionGate(void)
+{
+   m_gateUseSessions  = m_cfg.useSessionFilter;
+   m_gateSesBufferMin = m_cfg.sesBufferMin;
+   m_gateFriLateHours = m_cfg.blockFriLateHours;
+   m_friLateFromSec   = -1;
+   m_mktPublished     = false;
+   for(int i = 0; i < 7; i++)
+   {
+      m_mktHas[i]      = false;
+      m_mktOpenSec[i]  = 0;
+      m_mktCloseSec[i] = 0;
+   }
+
+   // Snapshot the broker's calendar for the whole week. Two passes on purpose: the first
+   // only asks whether the symbol publishes anything at all. Without that distinction a
+   // symbol with no published hours (every day "missing") would look permanently closed,
+   // and the gate would block every setup instead of none.
+   for(int dow = 0; dow < 7; dow++)
+   {
+      int o = 0, c = 0;
+      if(AILens_MarketHours(m_symbol, dow, o, c))
+      {
+         m_mktHas[dow]      = true;
+         m_mktOpenSec[dow]  = o;
+         m_mktCloseSec[dow] = c;
+         m_mktPublished     = true;
+      }
+   }
+
+   if(m_gateFriLateHours <= 0 || !m_mktHas[FRIDAY])
+      return;
+
+   // Derive the Friday cut-off from the BROKER's own Friday close, not from nyEnd.
+   // nyEnd is on the UTC/session clock; comparing it against broker time (the clock
+   // TimeToStruct gives us) was an hour-scale error waiting to happen. A -1 result means
+   // the fixed-hours fallback in SessionOk() is used instead.
+   m_friLateFromSec = m_mktCloseSec[FRIDAY] - m_gateFriLateHours * 3600;
+   if(m_friLateFromSec < 0)
+      m_friLateFromSec = 0;
+}
+
 //------------------------------------------------------------------//
 bool CAILensCore::SessionOk(const datetime t, bool &inSession, string &label) const
 {
    MqlDateTime d;
    TimeToStruct(t, d);
 
-   int h = (d.hour + m_cfg.sesTzOffsetHours) % 24;
+   int h = (d.hour + m_tzOffsetUsed) % 24;
    if(h < 0) h += 24;
    int m = d.min;
+   int secOfDay = d.hour * 3600 + d.min * 60 + d.sec;
 
    bool inA = m_cfg.tradeAsia   && AILens_InWindow(h, m_cfg.asiaStart,   m_cfg.asiaEnd);
    bool inL = m_cfg.tradeLondon && AILens_InWindow(h, m_cfg.londonStart, m_cfg.londonEnd);
    bool inN = m_cfg.tradeNy     && AILens_InWindow(h, m_cfg.nyStart,     m_cfg.nyEnd);
 
-   bool readyA = inA && AILens_MinsSinceOpen(h, m, m_cfg.asiaStart)   >= m_cfg.sesBufferMin;
-   bool readyL = inL && AILens_MinsSinceOpen(h, m, m_cfg.londonStart) >= m_cfg.sesBufferMin;
-   bool readyN = inN && AILens_MinsSinceOpen(h, m, m_cfg.nyStart)     >= m_cfg.sesBufferMin;
+   bool readyA = inA && AILens_MinsSinceOpen(h, m, m_cfg.asiaStart)   >= m_gateSesBufferMin;
+   bool readyL = inL && AILens_MinsSinceOpen(h, m, m_cfg.londonStart) >= m_gateSesBufferMin;
+   bool readyN = inN && AILens_MinsSinceOpen(h, m, m_cfg.nyStart)     >= m_gateSesBufferMin;
 
-   bool weekend = (d.day_of_week == 0 || d.day_of_week == 6);
-   bool friLate = (m_cfg.blockFriLateHours > 0 && d.day_of_week == 5 &&
-                   h >= m_cfg.nyEnd - m_cfg.blockFriLateHours);
+   // (1) Trading windows. Off means "no window restriction", not "closed".
+   bool windowOk = (!m_gateUseSessions) || readyA || readyL || readyN;
 
-   inSession = (readyA || readyL || readyN) && !weekend && !friLate;
+   // (2) Market calendar, from the snapshot taken in InitSessionGate(). This is the
+   // weekend rule, and it does not depend on the switch above: a weekend gap does not
+   // care which sessions you like to trade.
+   //
+   // `openToday` stays false for a weekday the broker does not list (Saturday/Sunday),
+   // so the single `m_mktPublished && !openToday` test covers both "outside today's hours"
+   // and "no session at all today". When the symbol publishes no calendar, m_mktPublished
+   // is false and nothing is blocked.
+   bool openToday = false;
+   if(d.day_of_week >= 0 && d.day_of_week < 7 && m_mktHas[d.day_of_week])
+      openToday = (secOfDay >= m_mktOpenSec[d.day_of_week] &&
+                   secOfDay <  m_mktCloseSec[d.day_of_week]);
 
-   if(inL && inN)         label = "OVERLAP";
+   bool closed = (m_mktPublished && !openToday);
+
+   bool friLate = (m_gateFriLateHours > 0 && d.day_of_week == FRIDAY);
+   if(friLate)
+   {
+      if(m_friLateFromSec >= 0)
+         friLate = (secOfDay >= m_friLateFromSec);
+      else
+      {
+         // Fallback when the broker publishes no Friday close: count back from the UTC
+         // session clock, matching what the old code did.
+         friLate = (h >= m_cfg.nyEnd - m_gateFriLateHours);
+      }
+   }
+
+   inSession = windowOk && !closed && !friLate;
+
+   // Label: name the reason the gate is shut when it is, otherwise name the window.
+   if(closed)             label = "CLOSED";
+   else if(friLate)       label = "OFF";
+   else if(!m_gateUseSessions) label = "ANY (filter off)";
+   else if(inL && inN)    label = "OVERLAP";
    else if(inL)           label = "LONDON";
    else if(inN)           label = "NY";
    else if(inA)           label = "ASIA";
-   else if(weekend)       label = "CLOSED";
    else                   label = "OFF";
 
-   return (m_cfg.useSessionFilter ? inSession : true);
+   return inSession;
 }
 
 //------------------------------------------------------------------//
@@ -1593,6 +1873,42 @@ bool CAILensCore::Step(void)
    if(advanced)
       m_lastBarTime = m_time[newestClosed];
    return advanced;
+}
+
+//------------------------------------------------------------------//
+// Human-readable market hours for the startup log: "Mon-Fri 01:00-23:59, Sun 23:05-23:59".
+// Consecutive identical days are collapsed, because most symbols are simply Mon-Fri.
+// Empty string when the broker publishes nothing, which is itself a useful thing to see.
+//------------------------------------------------------------------//
+string CAILensCore::MarketHoursSummary(void) const
+{
+   if(!m_mktPublished)
+      return "";
+
+   string out = "";
+   int i = 0;
+   while(i < 7)
+   {
+      if(!m_mktHas[i]) { i++; continue; }
+
+      // Extend the run while the next day is also open with identical hours.
+      int j = i;
+      while(j + 1 < 7 && m_mktHas[j + 1] &&
+            m_mktOpenSec[j + 1] == m_mktOpenSec[i] && m_mktCloseSec[j + 1] == m_mktCloseSec[i])
+         j++;
+
+      if(out != "")
+         out += ", ";
+      out += (i == j ? AILens_DayName(i)
+                     : AILens_DayName(i) + "-" + AILens_DayName(j));
+      out += " " + AILens_Hhmm(m_mktOpenSec[i]) + "-" + AILens_Hhmm(m_mktCloseSec[i]);
+      i = j + 1;
+   }
+
+   if(out == "")
+      return "<published but empty - gate will block>";
+
+   return out;
 }
 
 #endif // __AILENS_MQH__

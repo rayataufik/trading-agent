@@ -74,8 +74,13 @@ input bool   InpTrailFromStart   = false;
 input int    InpMaxBarsInTrade   = 0;
 
 input group "Session filter"
-input bool   InpUseSessionFilter = true;
-input int    InpSesTzOffsetHours = 0;
+// OFF: setups are allowed at any hour. Set true to re-enable the windows below; the
+// Python config has its own `enabled` key and the two are independent switches.
+input bool   InpUseSessionFilter = false;
+// Broker server is UTC+2: subtract 2 to reach the UTC clock the windows below use.
+// Fallback only - the real gap is measured at startup, so a summer-time switch to
+// UTC+3 is followed automatically. The value in use is printed in the Experts log.
+input int    InpSesTzOffsetHours = -2;
 input bool   InpTradeAsia        = false;
 input int    InpAsiaStart        = 0;
 input int    InpAsiaEnd          = 8;
@@ -296,6 +301,19 @@ int OnInit()
 
    if(InpEnableOrders && !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
       Print("AILens_EA: WARNING - orders enabled but AutoTrading is off");
+
+   // Session clock, logged once. A broker on summer time changes this on its own; if it
+   // reports the fallback while you know the server is UTC+2, the PC clock is wrong.
+   PrintFormat("AILens_EA: %s %s | session clock: broker%sh -> UTC (requested %sh)%s",
+               _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
+               AILens_SignedHours(g_core.TzOffsetUsed()),
+               AILens_SignedHours(g_core.TzOffsetRequested()),
+               (g_core.TzOffsetUsed() == g_core.TzOffsetRequested() ? "" : " [auto-detected]"));
+
+   // Broker market hours the weekend/Friday rule is built from.
+   string mh = g_core.MarketHoursSummary();
+   PrintFormat("AILens_EA: %s market hours (broker time): %s",
+               _Symbol, (mh == "" ? "<none published - market assumed open>" : mh));
 
    EventSetTimer(30);          // heartbeat: re-try warmup / re-check the feed
    return INIT_SUCCEEDED;
