@@ -340,7 +340,7 @@ void OnTimer(void)
    {
       g_ready = g_core.Warmup(InpHistoryBars);
       if(g_ready)
-         Print("AILens_EA: warmup completed, ", g_core.Bars(), " bars");
+         Print("AILens_EA: warmup completed, ", g_core.LoadedBars(), " bars");
    }
 }
 

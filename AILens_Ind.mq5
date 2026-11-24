@@ -244,7 +244,7 @@ void DrawPanel(void)
    SAILensTrade t = g_core.Trade();
 
    int x = 12, y = 22, dy = 16;
-   color cKey = clrSilver, cVal = clrWhiteSmoke;
+   color cVal = clrWhiteSmoke;
    color cBull = C'0,230,118', cBear = C'255,82,82', cCy = C'0,229,255', cWarn = C'255,215,64';
 
    string lead = (t.side == 1 ? "LONG" : (t.side == -1 ? "SHORT" : "WAIT"));
@@ -306,7 +306,7 @@ void DrawTradeBoxes(void)
    // Locate the entry bar by TIME. t.bar is only a display value: it is the shift the
    // engine saw when the trade opened, and shifts move with every new bar.
    int entryShift = 0;
-   for(int s = 0; s < g_core.Bars(); s++)
+   for(int s = 0; s < g_core.LoadedBars(); s++)
    {
       if(g_core.TimeAt(s) == t.entryTime) { entryShift = s; break; }
    }

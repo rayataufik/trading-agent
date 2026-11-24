@@ -209,7 +209,7 @@ private:
 
    // ---- internals ----
    bool  LoadSeries(const int want);
-   void  StepBar(const int shift, const bool isLatest);
+   void  StepBar(const int shift);
    void  Publish(const int shift, const string eventStr, const string regime,
                  const int regimeCode, const bool inSession, const string sesLabel,
                  const string structEvent, const int longScore, const int shortScore,
@@ -250,7 +250,7 @@ public:
    SAILensConfig     Cfg(void)   const { return m_cfg; }
    double            SwingH1(void) const { return m_swingH1; }
    double            SwingL1(void) const { return m_swingL1; }
-   int               Bars(void)    const { return m_n; }
+   int               LoadedBars(void) const { return m_n; }
    double            AtrAt(const int shift) const
                      { return (shift >= 0 && shift < m_n ? m_atr[shift] : EMPTY_VALUE); }
    double            CloseAt(const int shift) const
@@ -364,6 +364,9 @@ bool CAILensCore::Init(const SAILensConfig &cfg, const string symbol,
 //------------------------------------------------------------------//
 bool CAILensCore::LoadSeries(const int want)
 {
+   // The builtin is Bars(symbol, tf). The accessor used to be named Bars() too,
+   // which made MQL5 resolve the bare name to the member (method hiding) and fail.
+   // The accessor is LoadedBars() now, so the two can never be confused again.
    int avail = Bars(m_symbol, m_tf);
    if(avail < m_cfg.emaSlowLen + 10)
       return false;
@@ -995,7 +998,7 @@ bool CAILensCore::Warmup(const int maxBars)
    {
       if(shift > lastIndex - warm)       // not enough history behind this bar yet
          continue;
-      StepBar(shift, shift == 1);
+      StepBar(shift);
    }
 
    m_lastBarTime = m_time[1];            // the newest CLOSED bar
@@ -1115,10 +1118,9 @@ void CAILensCore::Publish(const int shift, const string eventStr,
 }
 
 //------------------------------------------------------------------//
-//  Process ONE closed bar. `isLatest` selects whether a setup on   //
-//  this bar should be surfaced as the current event.               //
+//  Process ONE closed bar.                                         //
 //------------------------------------------------------------------//
-void CAILensCore::StepBar(const int shift, const bool isLatest)
+void CAILensCore::StepBar(const int shift)
 {
    ComputePivots(shift);
 
@@ -1328,7 +1330,7 @@ int CAILensCore::ShiftOfTime(const datetime t) const
    int lo = 0, hi = m_n - 1;
    while(lo <= hi)
    {
-      int mid = (lo + hi) / 2;
+      int mid = (lo + hi) >> 1;   // integer midpoint; / on ints is fine but this is unambiguous
       if(m_time[mid] == t) return mid;
       if(m_time[mid] <  t) hi = mid - 1;    // series: newer times at lower indices
       else                 lo = mid + 1;
@@ -1392,7 +1394,7 @@ bool CAILensCore::Step(void)
    {
       if(shift > m_n - 1 - warm)
          continue;                          // not enough history behind this bar
-      StepBar(shift, shift == newestClosed);
+      StepBar(shift);
       advanced = true;
    }
 
