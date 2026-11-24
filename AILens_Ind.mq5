@@ -90,6 +90,7 @@ CAILensCore g_core;
 SAILensConfig g_cfg;
 bool g_ready = false;
 datetime g_lastBarTime = 0;
+uint     g_lastAttempt = 0;   // GetTickCount() of the last retry (real time, not server time)
 
 // object name prefix, so removal can never touch the user's own objects
 #define PFX "AIL_"
@@ -267,7 +268,16 @@ void DrawPanel(void)
             "Confluence  " + IntegerToString(aligned) + " of " + IntegerToString(o.activeFactors) + " aligned",
             (aligned >= o.activeFactors - 1 ? cBull : cVal), 8);
 
-   if(t.side != 0)
+   if(t.side == 0)
+   {
+      // Flat: remove the trade rows. Without this they stay on screen forever after
+      // the first trade closes, showing stale prices as if a position were still open.
+      ObjectDelete(0, PFX "p_entry");
+      ObjectDelete(0, PFX "p_stop");
+      ObjectDelete(0, PFX "p_tgts");
+      ObjectDelete(0, PFX "p_openr");
+   }
+   else
    {
       DrawRow(PFX "p_entry", x, y + dy * line++, "Entry       " + DoubleToString(t.entry, _Digits), cVal, 8);
       DrawRow(PFX "p_stop",  x, y + dy * line++, "Stop        " + DoubleToString(t.stop, _Digits) + (t.beMoved ? "  (BE)" : ""), cBear, 8);
@@ -284,11 +294,6 @@ void DrawPanel(void)
    DrawRow(PFX "p_struct", x, y + dy * line++, "Structure   " + o.structBias + (o.structEvent == "NONE" ? "" : "  " + o.structEvent),
             (o.structBias == "BULLISH" ? cBull : (o.structBias == "BEARISH" ? cBear : cVal)), 8);
 
-   // Remove rows left over from an earlier run that drew more of them.
-   static int lastRows = 0;
-   for(int extra = line; extra < lastRows; extra++)
-      ObjectDelete(0, PFX "p_row" + IntegerToString(extra));
-   lastRows = line;
 }
 
 //------------------------------------------------------------------//
@@ -346,29 +351,134 @@ int OnInit()
 
    if(!g_core.Init(g_cfg, _Symbol, (ENUM_TIMEFRAMES)Period()))
    {
-      Print("AILens_Ind: core init failed");
-      return INIT_FAILED;
+      Print("AILens_Ind: indicator handle creation failed, err=", GetLastError());
+      return INIT_FAILED;                 // genuinely fatal: nothing can work
    }
-   if(!g_core.Warmup(InpMaxBarsToDraw))
-   {
-      Print("AILens_Ind: warmup failed - not enough history yet");
-      return INIT_FAILED;
-   }
-
-   WipeObjects();
-   g_ready = true;
-   g_lastBarTime = 0;
 
    IndicatorSetString(INDICATOR_SHORTNAME, "AI Lens+");
+
+   // A failed warmup here is NOT fatal and must not return INIT_FAILED.
+   // MT5 runs OnInit before it has necessarily downloaded the chart history: on a
+   // symbol/timeframe you have not opened before, Bars() can be tiny or zero at this
+   // moment even though the data arrives seconds later. Returning INIT_FAILED would
+   // make MT5 delete the indicator from the chart permanently, so "not enough
+   // history yet" would mean "never works", which is exactly what you saw.
+   //
+   // Instead the indicator stays attached and retries: OnCalculate on every tick, and
+   // OnTimer every few seconds (including on a quiet market, where ticks are rare).
+   g_ready = g_core.Warmup(InpMaxBarsToDraw);
+   if(!g_ready)
+      PrintFormat("AILens_Ind: waiting for history on %s %s (need %d bars, have %d). "
+                  "Keep the chart open; the indicator goes live on its own when the "
+                  "terminal has downloaded enough bars.",
+                  _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
+                  g_core.MinBars(), ::Bars(_Symbol, (ENUM_TIMEFRAMES)Period()));
+
+   WipeObjects();
+   g_lastBarTime = 0;
+   g_lastAttempt = 0;
+
+   EventSetTimer(3);                     // retry even when the market is quiet
    return INIT_SUCCEEDED;
 }
 
 //------------------------------------------------------------------//
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    WipeObjects();
    g_core.Deinit();
    ChartRedraw();
+}
+
+//------------------------------------------------------------------//
+//  Retry warmup. Called from OnCalculate (any tick) and OnTimer (quiet market).
+//  Returns true once the core is live. The reload is not free (it copies ~15 series),
+//  so attempts are throttled to once every couple of seconds.
+//------------------------------------------------------------------//
+bool TryWarmup(void)
+{
+   if(g_ready)
+      return true;
+
+   // Throttle on GetTickCount() - REAL elapsed time - not on TimeCurrent().
+   // TimeCurrent() is the last known SERVER time and it freezes when the market is
+   // closed. Using it here would mean that attaching the indicator on a Saturday
+   // (exactly when there is no history being generated and none arriving) would
+   // compute a delay of 0 forever and never retry.
+   uint now = GetTickCount();
+   if(g_lastAttempt != 0 && (now - g_lastAttempt) < 2000)
+      return false;
+   g_lastAttempt = now;
+
+   if(!g_core.Warmup(InpMaxBarsToDraw))
+   {
+      // Say so ON THE CHART. A silent empty overlay looks like a broken indicator,
+      // and the usual reaction is to remove and re-add it, which fixes nothing.
+      int have = ::Bars(_Symbol, (ENUM_TIMEFRAMES)Period());
+      string msg = StringFormat("%s %s: loading history %d / %d bars...",
+                                _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
+                                have, g_core.MinBars());
+      if(ObjectFind(0, PFX "waiting") < 0)
+         ObjectCreate(0, PFX "waiting", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_XDISTANCE, 12);
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_YDISTANCE, 22);
+      ObjectSetString (0, PFX "waiting", OBJPROP_TEXT, msg);
+      ObjectSetString (0, PFX "waiting", OBJPROP_FONT, "Consolas");
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_FONTSIZE, 9);
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_COLOR, clrOrange);
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, PFX "waiting", OBJPROP_HIDDEN, true);
+      ChartRedraw();
+      return false;
+   }
+
+   ObjectDelete(0, PFX "waiting");
+
+   g_ready = true;
+   g_lastBarTime = 0;
+   PrintFormat("AILens_Ind: history ready on %s %s (%d bars loaded). Indicator is live.",
+               _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()), g_core.LoadedBars());
+   return true;
+}
+
+//------------------------------------------------------------------//
+//  Draw everything for the current state. One place, so the tick path and the
+//  timer path can never diverge in what they paint.
+//------------------------------------------------------------------//
+void DrawAll(void)
+{
+   if(InpShowLevels)
+   {
+      SAILensOut o = g_core.Out();
+      if(o.pdh != EMPTY_VALUE) DrawLevel(PFX "pdh", o.pdh, clrGray, STYLE_DOT);
+      if(o.pdl != EMPTY_VALUE) DrawLevel(PFX "pdl", o.pdl, clrGray, STYLE_DOT);
+      if(o.vwapV != EMPTY_VALUE) DrawLevel(PFX "vwap", o.vwapV, clrDimGray, STYLE_DOT);
+   }
+   DrawTradeBoxes();
+   DrawPanel();
+   ChartRedraw();
+}
+
+//------------------------------------------------------------------//
+void OnTimer(void)
+{
+   if(!TryWarmup())
+      return;
+
+   // The timer exists for two reasons only:
+   //   1. get the panel onto the chart right after a late warmup, and
+   //   2. pick up a closed bar on a market so quiet that no tick arrives.
+   // Outside those cases it must do nothing: repainting a chart every 3 s forever is
+   // pure CPU burn, and on a laptop that is a fan you can hear.
+   bool panelMissing = (ObjectFind(0, PFX "p_title") < 0);
+   bool advanced = g_core.Step();          // true only when a NEW bar was processed
+
+   if(!panelMissing && !advanced)
+      return;
+
+   DrawAll();
 }
 
 //------------------------------------------------------------------//
@@ -383,8 +493,13 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
-   if(!g_ready)
+   // Guard before touching the arrays: on the very first call MT5 can hand over an
+   // empty history, and time[rates_total-1] would then read out of bounds.
+   if(rates_total < 2)
       return 0;
+
+   if(!g_ready && !TryWarmup())
+      return 0;                          // still waiting for history; retry next tick
 
    // The core decides whether a closed bar is new; the indicator only decides when to
    // repaint. OnCalculate fires per tick, so a cheap guard saves a full redraw.
@@ -397,17 +512,7 @@ int OnCalculate(const int rates_total,
       // to exist on first attach, so do not bail out early.
       g_core.Step();
 
-      if(InpShowLevels)
-      {
-         SAILensOut o = g_core.Out();
-         if(o.pdh != EMPTY_VALUE) DrawLevel(PFX "pdh", o.pdh, clrGray, STYLE_DOT);
-         if(o.pdl != EMPTY_VALUE) DrawLevel(PFX "pdl", o.pdl, clrGray, STYLE_DOT);
-         if(o.vwapV != EMPTY_VALUE) DrawLevel(PFX "vwap", o.vwapV, clrDimGray, STYLE_DOT);
-      }
-
-      DrawTradeBoxes();
-      DrawPanel();
-      ChartRedraw();
+      DrawAll();
    }
 
    return rates_total;

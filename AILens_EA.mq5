@@ -299,14 +299,32 @@ void OnDeinit(const int reason)
 }
 
 //------------------------------------------------------------------//
+// Throttled warmup retry. Warmup copies ~15 series, and while the terminal is still
+// downloading history OnTick can fire thousands of times with nothing to do. Retrying
+// on every tick would make the terminal crawl exactly when it is already busy.
+bool TryWarmup(void)
+{
+   static uint lastAttempt = 0;
+   uint now = GetTickCount();
+   if(lastAttempt != 0 && (now - lastAttempt) < 2000)
+      return false;
+   lastAttempt = now;
+
+   if(!g_core.Warmup(InpHistoryBars))
+      return false;
+
+   g_ready = true;
+   PrintFormat("AILens_EA: warmup completed on %s %s (%d bars, %d required)",
+               _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
+               g_core.LoadedBars(), g_core.MinBars());
+   return true;
+}
+
+//------------------------------------------------------------------//
 void OnTick(void)
 {
-   if(!g_ready)
-   {
-      g_ready = g_core.Warmup(InpHistoryBars);
-      if(!g_ready)
-         return;
-   }
+   if(!g_ready && !TryWarmup())
+      return;
 
    // Step() owns the closed-bar bookkeeping and returns false when no new bar closed.
    // Tracking it here as well would mean two clocks that can disagree - and the one
@@ -335,13 +353,15 @@ void OnTick(void)
 //------------------------------------------------------------------//
 void OnTimer(void)
 {
-   // Warmup retry while the terminal is still loading history.
+   // Warmup retry while the terminal is still loading history, and a safety net for a
+   // market quiet enough that no tick arrives and a closed bar would otherwise be
+   // processed late (or not at all) while the EA is running live.
    if(!g_ready)
    {
-      g_ready = g_core.Warmup(InpHistoryBars);
-      if(g_ready)
-         Print("AILens_EA: warmup completed, ", g_core.LoadedBars(), " bars");
+      TryWarmup();
+      return;
    }
+   OnTick();
 }
 
 //==================================================================//

@@ -251,6 +251,10 @@ public:
    double            SwingH1(void) const { return m_swingH1; }
    double            SwingL1(void) const { return m_swingL1; }
    int               LoadedBars(void) const { return m_n; }
+   // Hard minimum history before LoadSeries will accept the chart at all. Must match
+   // the gate inside LoadSeries, otherwise the "waiting for history" message reports a
+   // number the code never actually waits for.
+   int               MinBars(void) const { return m_cfg.emaSlowLen + 10; }
    double            AtrAt(const int shift) const
                      { return (shift >= 0 && shift < m_n ? m_atr[shift] : EMPTY_VALUE); }
    double            CloseAt(const int shift) const
