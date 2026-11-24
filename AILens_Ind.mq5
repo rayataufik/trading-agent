@@ -80,6 +80,9 @@ input int    InpBlockFriLateHours = 3;
 
 input group "Display"
 input bool   InpShowPanel        = true;
+input bool   InpPanelBackdrop    = true;    // dark box behind the panel text
+input color  InpPanelBackColor   = C'10,14,20';  // backdrop colour
+input int    InpPanelRowPx       = 16;      // px per row (raise if rows overlap)
 input bool   InpShowLevels       = true;
 input int    InpMaxBarsToDraw    = 3000;    // Bars to load and draw
 
@@ -180,6 +183,13 @@ void WipeObjects(void)
 // Panel rows are OBJ_LABELs, not OBJ_TEXTs. OBJ_TEXT is anchored to a time/price
 // coordinate, so a pixel offset like (10, 20) places the text in 1970. Labels are
 // anchored to a chart corner and positioned in pixels, which is what a panel needs.
+//
+// DrawRow also records the widest row drawn since the last backdrop reset, so the
+// background box can be sized to the actual text instead of a guessed constant. The
+// width estimate is per-character and monospace-specific on purpose: Consolas is
+// fixed-width, so len * size * 0.62 is accurate enough for a backdrop.
+double g_panelW = 0.0;
+
 void DrawRow(const string nm, const int x, const int y, const string txt,
              const color clr, const int size = 8)
 {
@@ -195,6 +205,13 @@ void DrawRow(const string nm, const int x, const int y, const string txt,
    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, nm, OBJPROP_BACK, false);
+   // Above the panel backdrop (zorder 0). Both would otherwise default to 0 and the
+   // draw order would decide who hides whom - and the box is drawn last.
+   ObjectSetInteger(0, nm, OBJPROP_ZORDER, 10);
+
+   double w = StringLen(txt) * size * 0.62;
+   if(w > g_panelW)
+      g_panelW = w;
 }
 
 //------------------------------------------------------------------//
@@ -237,14 +254,39 @@ void DrawHLine(const string nm, const int shift1, const int shift2, const double
 //  DRAWING                                                         //
 //==================================================================//
 //------------------------------------------------------------------//
+//  Forward declaration: DrawPanel calls this before it is defined below.
+//------------------------------------------------------------------//
+void DrawPanelBackdrop(const int x, const int y, const int rows, const int dy);
+
+//------------------------------------------------------------------//
 void DrawPanel(void)
 {
-   if(!InpShowPanel) { ObjectDelete(0, PFX "panel"); return; }
+   if(!InpShowPanel)
+   {
+      // Remove everything the panel owns, including the backdrop. Deleting only
+      // "panel" (a name no object ever uses) left the whole panel on screen.
+      for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+      {
+         string nm = ObjectName(0, i);
+         if(StringFind(nm, PFX "p_") == 0)
+            ObjectDelete(0, nm);
+      }
+      return;
+   }
 
    SAILensOut o = g_core.Out();
    SAILensTrade t = g_core.Trade();
 
-   int x = 12, y = 22, dy = 16;
+   int x = 12, y = 22;
+   // Row pitch is scaled to the terminal's DPI. A fixed 16 px is what made the rows
+   // collide into an unreadable smear on a scaled display: the font grows with the
+   // system scaling, the pitch did not. At 96 dpi nothing changes; at 150% the pitch
+   // becomes ~24 px.
+   int dpi = (int)TerminalInfoInteger(TERMINAL_SCREEN_DPI);
+   if(dpi < 96) dpi = 96;
+   int dy = (int)MathRound((double)InpPanelRowPx * dpi / 96.0);
+   if(dy < 8) dy = 8;
+   g_panelW = 0.0;
    color cVal = clrWhiteSmoke;
    color cBull = C'0,230,118', cBear = C'255,82,82', cCy = C'0,229,255', cWarn = C'255,215,64';
 
@@ -252,8 +294,12 @@ void DrawPanel(void)
    color  leadC = (t.side == 1 ? cBull : (t.side == -1 ? cBear : cVal));
 
    int line = 0;
-   DrawRow(PFX "p_title", x, y + dy * line++, "AI AGENT LENS +  " + _Symbol + " " + TfStr(PERIOD_CURRENT), cCy, 9);
+   DrawRow(PFX "p_title", x, y + dy * line++, "AI AGENT LENS +  " + _Symbol + " " + TfStr((ENUM_TIMEFRAMES)Period()), cCy, 9);
    DrawRow(PFX "p_hero",  x, y + dy * line++, lead + "   " + IntegerToString(t.side == 1 ? o.longScore : (t.side == -1 ? o.shortScore : 0)), leadC, 12);
+   // The hero row is drawn at 12pt while every other row is 8pt, so it needs roughly
+   // 1.5x the pitch. Without this extra slot its descenders land on the Regime row -
+   // which is exactly the overlap visible in the panel.
+   line++;
 
    DrawRow(PFX "p_regime", x, y + dy * line++, "Regime      " + o.regime, cVal, 8);
    DrawRow(PFX "p_sess",   x, y + dy * line++, "Session     " + o.sesLabel + (o.inSession ? "" : " (blocked)"),
@@ -294,6 +340,47 @@ void DrawPanel(void)
    DrawRow(PFX "p_struct", x, y + dy * line++, "Structure   " + o.structBias + (o.structEvent == "NONE" ? "" : "  " + o.structEvent),
             (o.structBias == "BULLISH" ? cBull : (o.structBias == "BEARISH" ? cBear : cVal)), 8);
 
+   DrawPanelBackdrop(x, y, line, dy);
+}
+
+//------------------------------------------------------------------//
+// Dark box behind the panel text. Without it the labels sit straight on top of the
+// candles, and on a busy chart the numbers become unreadable exactly when you need
+// them. OBJ_RECTANGLE_LABEL draws in pixels from a chart corner, so it can be placed
+// behind the text without touching time/price coordinates.
+//------------------------------------------------------------------//
+void DrawPanelBackdrop(const int x, const int y, const int rows, const int dy)
+{
+   if(!InpPanelBackdrop)
+   {
+      ObjectDelete(0, PFX "p_bg");
+      return;
+   }
+   if(rows <= 0)
+      return;
+
+   // Pad on both sides; the width comes from the widest row DrawRow actually drew.
+   int padX = 8, padY = 6;
+   int boxW = (int)MathCeil(g_panelW) + padX * 2;
+   int boxH = rows * dy + padY * 2;
+
+   if(ObjectFind(0, PFX "p_bg") < 0)
+      ObjectCreate(0, PFX "p_bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_CORNER,      CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_XDISTANCE,   x - padX);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_YDISTANCE,   y - padY);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_XSIZE,       boxW);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_YSIZE,       boxH);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_BGCOLOR,     InpPanelBackColor);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_COLOR,       C'45,55,70');
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_WIDTH,       1);
+   // Z-order, not OBJPROP_BACK: a BACK object can be hidden by the chart's own grid,
+   // while z-order reliably puts this box behind the rows drawn after it.
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_ZORDER,      0);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, PFX "p_bg", OBJPROP_HIDDEN,      true);
 }
 
 //------------------------------------------------------------------//

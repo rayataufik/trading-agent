@@ -258,7 +258,7 @@ void SendSetupMessage(void)
                     ? t.entry + InpRewardRisk * MathAbs(t.entry - t.stop)
                     : t.entry - InpRewardRisk * MathAbs(t.entry - t.stop));
 
-   string msg = arrow + side + "  " + _Symbol + "  " + AILens_TfToString(PERIOD_CURRENT) + "\n"
+   string msg = arrow + side + "  " + _Symbol + "  " + AILens_TfToString((ENUM_TIMEFRAMES)Period()) + "\n"
               + "Score      " + IntegerToString(t.side == 1 ? o.longScore : o.shortScore) + "\n"
               + "Entry      " + DoubleToString(t.entry, _Digits) + "\n"
               + "Stop       " + DoubleToString(t.stop, _Digits) + "\n"

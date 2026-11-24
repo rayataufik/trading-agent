@@ -133,6 +133,12 @@ struct SAILensTrade
 //==================================================================//
 string AILens_TfToString(ENUM_TIMEFRAMES tf)
 {
+   // PERIOD_CURRENT is the sentinel 0, not a timeframe with a name. Callers that pass it
+   // want "the chart's timeframe", so resolve it here rather than printing "TF0". This is
+   // also why the default case below names the number instead of guessing a TF.
+   if(tf == PERIOD_CURRENT)
+      tf = (ENUM_TIMEFRAMES)Period();
+
    switch(tf)
    {
       case PERIOD_M1:  return "M1";
