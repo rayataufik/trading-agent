@@ -136,14 +136,30 @@ string AILens_TfToString(ENUM_TIMEFRAMES tf)
    switch(tf)
    {
       case PERIOD_M1:  return "M1";
+      case PERIOD_M2:  return "M2";
+      case PERIOD_M3:  return "M3";
+      case PERIOD_M4:  return "M4";
       case PERIOD_M5:  return "M5";
+      case PERIOD_M6:  return "M6";
+      case PERIOD_M10: return "M10";
+      case PERIOD_M12: return "M12";
       case PERIOD_M15: return "M15";
+      case PERIOD_M20: return "M20";
       case PERIOD_M30: return "M30";
       case PERIOD_H1:  return "H1";
+      case PERIOD_H2:  return "H2";
+      case PERIOD_H3:  return "H3";
       case PERIOD_H4:  return "H4";
+      case PERIOD_H6:  return "H6";
+      case PERIOD_H8:  return "H8";
+      case PERIOD_H12: return "H12";
       case PERIOD_D1:  return "D1";
+      case PERIOD_W1:  return "W1";
+      case PERIOD_MN1: return "MN1";
    }
-   return "M15";
+   // Never fall back to a specific timeframe: a wrong label in the log would send you
+   // looking at data for a chart you are not even on. Name the unknown instead.
+   return "TF" + IntegerToString((int)tf);
 }
 
 // Window test. start == end means never, matching the Pine helper.
@@ -205,7 +221,8 @@ private:
    string       m_structBias;
    datetime     m_lastBarTime;   // newest CLOSED bar time processed
    datetime     m_formingTime;   // time of the bar still forming, i.e. m_time[0]
-   bool         m_loaded;
+   string       m_lastError;     // why the last load failed; "" when it succeeded
+   uint         m_lastLoadAttempt; // GetTickCount() of the last LoadSeries attempt
 
    // ---- internals ----
    bool  LoadSeries(const int want);
@@ -251,10 +268,14 @@ public:
    double            SwingH1(void) const { return m_swingH1; }
    double            SwingL1(void) const { return m_swingL1; }
    int               LoadedBars(void) const { return m_n; }
-   // Hard minimum history before LoadSeries will accept the chart at all. Must match
-   // the gate inside LoadSeries, otherwise the "waiting for history" message reports a
-   // number the code never actually waits for.
-   int               MinBars(void) const { return m_cfg.emaSlowLen + 10; }
+   // Minimum history the engine can actually work with: WarmupBars() of indicator context
+   // plus the forming bar, the newest closed bar, and a few spare. Checking a single
+   // number here means the gates and the log messages cannot disagree about what "enough
+   // history" means. Defined out-of-line because it calls WarmupBars().
+   int               MinBars(void) const;
+   // Human-readable reason the last LoadSeries/Warmup failed, for logs and the
+   // on-chart waiting label. Empty string when the last attempt succeeded.
+   string            LastError(void) const { return m_lastError; }
    double            AtrAt(const int shift) const
                      { return (shift >= 0 && shift < m_n ? m_atr[shift] : EMPTY_VALUE); }
    double            CloseAt(const int shift) const
@@ -274,7 +295,8 @@ CAILensCore::CAILensCore(void)
    m_n = 0;
    m_formingTime = 0;
    m_lastBarTime = 0;
-   m_loaded = false;
+   m_lastError = "";
+   m_lastLoadAttempt = 0;
 
    m_trade.side = 0;
    m_trade.status = "NONE";
@@ -335,9 +357,34 @@ void CAILensCore::Deinit(void)
 bool CAILensCore::Init(const SAILensConfig &cfg, const string symbol,
                        const ENUM_TIMEFRAMES tf)
 {
+   // Release any handles from a previous Init on this object. OnInit runs again on a
+   // timeframe switch while the global core object is reused, and creating a second set
+   // of handles without releasing the first leaks them (MT5 keeps a limited pool).
+   Deinit();
+
    m_cfg    = cfg;
    m_symbol = (symbol == "" ? _Symbol : symbol);
    m_tf     = tf;
+
+   // State from the previous timeframe must not survive: the bars changed, so every
+   // stored shift, price and trade reference is meaningless now. ResetState() clears the
+   // simulated trade too. The HTF arrays are dropped as well, because a timeframe above
+   // the HTF leaves m_hHtfEma invalid, in which case LoadSeries never rewrites them and
+   // BuildHtfArrays would happily read the previous timeframe's bias.
+   ResetState();
+   // ResetState deliberately keeps m_n (Warmup needs it after LoadSeries), so the bar
+   // count from the previous timeframe has to be cleared here.
+   m_n = 0;
+   m_lastError = "";
+   m_lastLoadAttempt = 0;
+   // Stale HTF bias must go too. A timeframe ABOVE the HTF leaves m_hHtfEma invalid, so
+   // LoadSeries would never rewrite these arrays and BuildHtfArrays would read the
+   // previous timeframe's prices as the current one's bias.
+   ArrayResize(m_htfTime,  0);
+   ArrayResize(m_htfClose, 0);
+   ArrayResize(m_htfEma,   0);
+   ArrayResize(m_htfBiasArr,  0);
+   ArrayResize(m_htfValidArr, 0);
 
    m_hEmaF = iMA(m_symbol, m_tf, m_cfg.emaFastLen, 0, MODE_EMA, PRICE_CLOSE);
    m_hEmaM = iMA(m_symbol, m_tf, m_cfg.emaMidLen,  0, MODE_EMA, PRICE_CLOSE);
@@ -365,23 +412,109 @@ bool CAILensCore::Init(const SAILensConfig &cfg, const string symbol,
 
 //------------------------------------------------------------------//
 //  Load all series once, indexed by shift (0 = newest).            //
+//                                                                  //
+//  Two things make this more delicate than it looks:               //
+//                                                                  //
+//  1. Partial copies. Every array is resized as soon as it is      //
+//     copied, so a failure halfway through would leave the engine  //
+//     holding n-long arrays with a stale bar count. m_n is only    //
+//     published after the last copy succeeds, so a failure leaves  //
+//     the engine empty instead of reading past the end.            //
+//                                                                  //
+//  2. Retry cost. A caller in a tick loop retries every tick, and  //
+//     re-copying ~15 arrays per tick is exactly what the Step gate  //
+//     exists to avoid. Worse, hammering CopyBuffer while MT5 is    //
+//     still calculating can restart the work and delay the data it  //
+//     is waiting for. A short real-time throttle fixes both. It    //
+//     uses GetTickCount(), never server time: server time freezes   //
+//     when the market is closed, which is exactly when a late       //
+//     attach happens.                                              //
 //------------------------------------------------------------------//
+#define AILENS_LOAD_RETRY_MS 500
+
 bool CAILensCore::LoadSeries(const int want)
 {
+   if(m_lastLoadAttempt != 0 && (GetTickCount() - m_lastLoadAttempt) < AILENS_LOAD_RETRY_MS)
+      return false;
+   m_lastLoadAttempt = GetTickCount();
+
    // The builtin is Bars(symbol, tf). The accessor used to be named Bars() too,
    // which made MQL5 resolve the bare name to the member (method hiding) and fail.
    // The accessor is LoadedBars() now, so the two can never be confused again.
    int avail = Bars(m_symbol, m_tf);
-   if(avail < m_cfg.emaSlowLen + 10)
-      return false;
 
-   int n = (want > 0 && want < avail ? want : avail);
-   m_n = n;
+   // Minimum that can actually be SCORED, not a raw bar count. WarmupBars() of context
+   // must sit behind the oldest bar the engine evaluates, so loading exactly WarmupBars()
+   // would leave essentially nothing scoreable: the engine would come up "live" and draw
+   // an empty panel, the half-state a timeframe switch produces while the buffers are
+   // still filling. MinBars() carries the extra margin; a single number keeps the gates
+   // and the messages consistent.
+   int minimum = MinBars();
+
+   // Check the chart before the buffers. "Not enough chart history" and "the indicator
+   // buffers are not ready" are different problems with different fixes, and reporting
+   // the wrong one hides the real cause.
+   if(avail < minimum)
+   {
+      m_lastError = StringFormat("chart history %d bars, need %d", avail, minimum);
+      return false;
+   }
+
+   // CRITICAL: a handle is not a data source until MT5 has finished calculating it.
+   // Right after iMA()/iRSI()/... are created - which is exactly what happens on every
+   // timeframe switch, because OnInit creates a fresh core - BarsCalculated() is 0 or
+   // small, and CopyBuffer for more bars than that returns FEWER than requested.
+   //
+   // The old code used `avail` (chart bars) as the copy count, so on a timeframe switch
+   // it asked for thousands of buffer values that did not exist yet and failed every
+   // single time, forever, while reporting "not enough history" - which was misleading:
+   // the history was there, the indicator buffers were not.
+   //
+   // So the copyable window is the SMALLEST BarsCalculated among all handles, and
+   // loading is simply retried until that window is big enough.
+   int calc = BarsCalculated(m_hEmaF);
+   int h;
+   h = BarsCalculated(m_hEmaM); if(h < calc) calc = h;
+   h = BarsCalculated(m_hEmaS); if(h < calc) calc = h;
+   h = BarsCalculated(m_hRsi);  if(h < calc) calc = h;
+   h = BarsCalculated(m_hMacd); if(h < calc) calc = h;
+   h = BarsCalculated(m_hAdx);  if(h < calc) calc = h;
+   h = BarsCalculated(m_hAtr);  if(h < calc) calc = h;
+
+   if(calc <= 0)
+   {
+      m_lastError = (calc < 0
+                     ? "indicator buffer unavailable (BarsCalculated returned -1)"
+                     : "indicator buffers still calculating (0 bars ready)");
+      return false;
+   }
+
+   // Only copy what BOTH the chart and every indicator buffer can provide.
+   int usable = (calc < avail ? calc : avail);
+   if(usable < minimum)
+   {
+      m_lastError = StringFormat("indicators calculated %d of %d bars (chart has %d)",
+                                 usable, minimum, avail);
+      return false;
+   }
+
+   int n = (want > 0 && want < usable ? want : usable);
+   if(n < minimum)
+      n = minimum;        // a too-small "want" is a misconfiguration, not a reason to stay dark
 
    // CopyBuffer/CopyTime fill arrays in chronological order by default (index 0 = oldest).
    // Every index in this file is a SHIFT (0 = current bar), so every destination array
    // must be marked as a series array first. Forgetting this silently reverses every
    // indicator read - the arrays still have the right contents, in the wrong order.
+   //
+   // m_n is cleared for the whole copy phase and published only at the very end.
+   // CopyTime resizes the arrays to n as its first action, so if a later CopyBuffer
+   // fails, the arrays are already n long while an older m_n could still be larger, and
+   // every later read would index past the end. Zeroing it first makes the "no data"
+   // state explicit: every reader is bounds-checked against m_n, so a failed load leaves
+   // the engine safely empty until a later retry succeeds.
+   m_n = 0;
+
    ArraySetAsSeries(m_time,  true);
    ArraySetAsSeries(m_open,  true);
    ArraySetAsSeries(m_high,  true);
@@ -398,27 +531,33 @@ bool CAILensCore::LoadSeries(const int want)
    ArraySetAsSeries(m_dim,   true);
    ArraySetAsSeries(m_atr,   true);
 
-   if(CopyTime(m_symbol, m_tf, 0, n, m_time) != n) return false;
-   if(CopyOpen(m_symbol, m_tf, 0, n, m_open) != n) return false;
-   if(CopyHigh(m_symbol, m_tf, 0, n, m_high) != n) return false;
-   if(CopyLow (m_symbol, m_tf, 0, n, m_low ) != n) return false;
-   if(CopyClose(m_symbol, m_tf, 0, n, m_close) != n) return false;
+   // m_n is published only AFTER every copy succeeds. Setting it first would leave the
+   // engine claiming N bars while the arrays hold none, and every later index would
+   // read out of range.
+   if(CopyTime(m_symbol, m_tf, 0, n, m_time) != n) { m_lastError = "CopyTime failed"; return false; }
+   if(CopyOpen(m_symbol, m_tf, 0, n, m_open) != n) { m_lastError = "CopyOpen failed"; return false; }
+   if(CopyHigh(m_symbol, m_tf, 0, n, m_high) != n) { m_lastError = "CopyHigh failed"; return false; }
+   if(CopyLow (m_symbol, m_tf, 0, n, m_low ) != n) { m_lastError = "CopyLow failed";  return false; }
+   if(CopyClose(m_symbol, m_tf, 0, n, m_close) != n) { m_lastError = "CopyClose failed"; return false; }
    ArraySetAsSeries(m_volRaw, true);
-   if(CopyTickVolume(m_symbol, m_tf, 0, n, m_volRaw) != n) return false;
+   if(CopyTickVolume(m_symbol, m_tf, 0, n, m_volRaw) != n) { m_lastError = "CopyTickVolume failed"; return false; }
    ArrayResize(m_vol, n);
    for(int i = 0; i < n; i++)
       m_vol[i] = (double)m_volRaw[i];
 
-   if(CopyBuffer(m_hEmaF, 0, 0, n, m_emaF) != n) return false;
-   if(CopyBuffer(m_hEmaM, 0, 0, n, m_emaM) != n) return false;
-   if(CopyBuffer(m_hEmaS, 0, 0, n, m_emaS) != n) return false;
-   if(CopyBuffer(m_hRsi,  0, 0, n, m_rsi ) != n) return false;
-   if(CopyBuffer(m_hMacd, 0, 0, n, m_macd) != n) return false;
-   if(CopyBuffer(m_hMacd, 1, 0, n, m_sig ) != n) return false;
-   if(CopyBuffer(m_hAdx,  0, 0, n, m_adx ) != n) return false;
-   if(CopyBuffer(m_hAdx,  1, 0, n, m_dip ) != n) return false;
-   if(CopyBuffer(m_hAdx,  2, 0, n, m_dim ) != n) return false;
-   if(CopyBuffer(m_hAtr,  0, 0, n, m_atr ) != n) return false;
+   if(CopyBuffer(m_hEmaF, 0, 0, n, m_emaF) != n) { m_lastError = "EMA fast buffer not ready"; return false; }
+   if(CopyBuffer(m_hEmaM, 0, 0, n, m_emaM) != n) { m_lastError = "EMA mid buffer not ready";  return false; }
+   if(CopyBuffer(m_hEmaS, 0, 0, n, m_emaS) != n) { m_lastError = "EMA slow buffer not ready"; return false; }
+   if(CopyBuffer(m_hRsi,  0, 0, n, m_rsi ) != n) { m_lastError = "RSI buffer not ready";  return false; }
+   if(CopyBuffer(m_hMacd, 0, 0, n, m_macd) != n) { m_lastError = "MACD main buffer not ready"; return false; }
+   if(CopyBuffer(m_hMacd, 1, 0, n, m_sig ) != n) { m_lastError = "MACD signal buffer not ready"; return false; }
+   if(CopyBuffer(m_hAdx,  0, 0, n, m_adx ) != n) { m_lastError = "ADX main buffer not ready"; return false; }
+   if(CopyBuffer(m_hAdx,  1, 0, n, m_dip ) != n) { m_lastError = "ADX +DI buffer not ready"; return false; }
+   if(CopyBuffer(m_hAdx,  2, 0, n, m_dim ) != n) { m_lastError = "ADX -DI buffer not ready"; return false; }
+   if(CopyBuffer(m_hAtr,  0, 0, n, m_atr ) != n) { m_lastError = "ATR buffer not ready"; return false; }
+
+   m_n = n;
+   m_lastError = "";
 
    // ---- session VWAP, reset at each broker day change ----
    // Walk OLDEST -> NEWEST. In a series array the oldest bar is at index n-1 and the
@@ -479,18 +618,39 @@ bool CAILensCore::LoadSeries(const int want)
    }
 
    // ---- HTF series ----
+   // The HTF EMA handle has the same "not calculated yet" problem as the chart ones.
+   // Not fatal: BuildHtfArrays() treats a short/empty HTF series as "bias unavailable",
+   // and the score already handles that case (Redistribute or Neutral 10).
    if(m_hHtfEma != INVALID_HANDLE)
    {
       ArraySetAsSeries(m_htfTime,  true);
       ArraySetAsSeries(m_htfClose, true);
       ArraySetAsSeries(m_htfEma,   true);
+
+      int htfCalc  = BarsCalculated(m_hHtfEma);
       int htfAvail = Bars(m_symbol, m_cfg.htfTf);
-      int hn = (htfAvail > 400 ? 400 : htfAvail);
+      int hn = 400;
+      if(htfAvail < hn) hn = htfAvail;
+      if(htfCalc  < hn) hn = htfCalc;          // copy only what actually exists
+
       if(hn > 5)
       {
-         CopyTime  (m_symbol, m_cfg.htfTf, 0, hn, m_htfTime);
-         CopyClose (m_symbol, m_cfg.htfTf, 0, hn, m_htfClose);
-         CopyBuffer(m_hHtfEma, 0, 0, hn, m_htfEma);
+         // Only accept a fully copied set; a partial copy would leave stale values in
+         // the tail of the arrays and invent a bias for bars that have none.
+         if(CopyTime  (m_symbol, m_cfg.htfTf, 0, hn, m_htfTime)  != hn ||
+            CopyClose (m_symbol, m_cfg.htfTf, 0, hn, m_htfClose) != hn ||
+            CopyBuffer(m_hHtfEma, 0, 0, hn, m_htfEma)            != hn)
+         {
+            ArrayResize(m_htfTime,  0);
+            ArrayResize(m_htfClose, 0);
+            ArrayResize(m_htfEma,   0);
+         }
+      }
+      else
+      {
+         ArrayResize(m_htfTime,  0);
+         ArrayResize(m_htfClose, 0);
+         ArrayResize(m_htfEma,   0);
       }
    }
 
@@ -1007,7 +1167,6 @@ bool CAILensCore::Warmup(const int maxBars)
 
    m_lastBarTime = m_time[1];            // the newest CLOSED bar
    m_formingTime = m_time[0];            // the bar still forming
-   m_loaded      = true;
    return true;
 }
 
@@ -1039,7 +1198,6 @@ void CAILensCore::ResetState(void)
    m_structBias   = "MIXED";
    m_lastBarTime  = 0;
    m_formingTime  = 0;
-   m_loaded       = false;
 }
 
 //------------------------------------------------------------------//
@@ -1049,6 +1207,20 @@ void CAILensCore::ResetState(void)
 int CAILensCore::WarmupBars(void) const
 {
    return m_cfg.emaSlowLen + m_cfg.atrPctLen + m_cfg.swingLen * 2 + 5;
+}
+
+//------------------------------------------------------------------//
+//  MinBars: smallest chart size that still lets the newest closed   //
+//  bar be scored. Anything less would leave the engine "loaded" with //
+//  nothing it can evaluate. Must match the gate in LoadSeries.       //
+//------------------------------------------------------------------//
+int CAILensCore::MinBars(void) const
+{
+   // WarmupBars() of context, plus the forming bar, plus the newest closed bar, plus a
+   // few spare bars so the newest closed bar is genuinely scoreable rather than the only
+   // one. Using one number for "can start" everywhere (gates and messages) keeps the log
+   // honest about what the engine actually waits for.
+   return WarmupBars() + 6;
 }
 
 //------------------------------------------------------------------//
@@ -1356,9 +1528,13 @@ bool CAILensCore::Step(void)
    // OnTick fires on every tick, and a tick loop can run thousands of times per bar.
    // LoadSeries copies ~15 arrays of a few thousand bars; doing that per tick would
    // make a one-year tester run take days. iTime(...,0) is a single lookup, and if the
-   // forming bar has not changed since the last call, no bar has closed and there is
-   // nothing at all to do.
-   if(m_loaded)
+   // forming bar has not changed since the last successful load, no bar has closed and
+   // there is nothing at all to do.
+   //
+   // The gate keys off m_formingTime, which LoadSeries never touches on a failed attempt,
+   // so a retry costs nothing until the forming bar actually rolls over. That is the
+   // property that keeps this cheap under a tick storm, and it survives the failure path.
+   if(m_formingTime != 0)
    {
       datetime forming = iTime(m_symbol, m_tf, 0);
       if(forming == 0)                 // history not ready yet
@@ -1368,10 +1544,16 @@ bool CAILensCore::Step(void)
    }
 
    if(!LoadSeries(m_n > 0 ? m_n : 0))
+   {
+      // Clear the gate so the next tick retries (LoadSeries throttles itself to twice a
+      // second). Without this, one transient CopyBuffer failure during a new bar would
+      // keep the gate closed until the bar AFTER it formed, delaying the alert for the
+      // bar that just closed - which is the one signal that matters.
+      m_formingTime = 0;
       return false;
+   }
 
    m_formingTime = m_time[0];
-   m_loaded = true;
 
    // The first CLOSED bar we have not processed yet. m_time[0] is the forming bar.
    int newestClosed = 1;

@@ -368,11 +368,9 @@ int OnInit()
    // OnTimer every few seconds (including on a quiet market, where ticks are rare).
    g_ready = g_core.Warmup(InpMaxBarsToDraw);
    if(!g_ready)
-      PrintFormat("AILens_Ind: waiting for history on %s %s (need %d bars, have %d). "
-                  "Keep the chart open; the indicator goes live on its own when the "
-                  "terminal has downloaded enough bars.",
-                  _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
-                  g_core.MinBars(), ::Bars(_Symbol, (ENUM_TIMEFRAMES)Period()));
+      PrintFormat("AILens_Ind: not live yet on %s %s - %s. Keep the chart open; the "
+                  "indicator goes live on its own when the terminal has the data.",
+                  _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()), g_core.LastError());
 
    WipeObjects();
    g_lastBarTime = 0;
@@ -388,6 +386,11 @@ void OnDeinit(const int reason)
    EventKillTimer();
    WipeObjects();
    g_core.Deinit();
+   // Leaving this true would make TryWarmup() believe the core is live after a
+   // timeframe change has already invalidated it, and the "waiting" label would never
+   // appear even though nothing has been loaded for the new timeframe yet.
+   g_ready = false;
+   g_lastBarTime = 0;
    ChartRedraw();
 }
 
@@ -413,12 +416,16 @@ bool TryWarmup(void)
 
    if(!g_core.Warmup(InpMaxBarsToDraw))
    {
-      // Say so ON THE CHART. A silent empty overlay looks like a broken indicator,
-      // and the usual reaction is to remove and re-add it, which fixes nothing.
-      int have = ::Bars(_Symbol, (ENUM_TIMEFRAMES)Period());
-      string msg = StringFormat("%s %s: loading history %d / %d bars...",
-                                _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
-                                have, g_core.MinBars());
+      // Say so ON THE CHART, and say WHY. A silent empty overlay looks like a broken
+      // indicator, and the usual reaction is to remove and re-add it, which fixes
+      // nothing. The reason text comes from the core, so it names the real failure
+      // (chart history short, or indicator buffers still calculating) instead of
+      // guessing "not enough history" for every possible cause.
+      string why = g_core.LastError();
+      if(why == "")
+         why = "starting up";
+      string msg = StringFormat("%s %s: waiting - %s",
+                                _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()), why);
       if(ObjectFind(0, PFX "waiting") < 0)
          ObjectCreate(0, PFX "waiting", OBJ_LABEL, 0, 0, 0);
       ObjectSetInteger(0, PFX "waiting", OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -493,8 +500,7 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
-   // Guard before touching the arrays: on the very first call MT5 can hand over an
-   // empty history, and time[rates_total-1] would then read out of bounds.
+   // Guard before any access: on the very first call MT5 can hand over an empty history.
    if(rates_total < 2)
       return 0;
 
@@ -503,7 +509,15 @@ int OnCalculate(const int rates_total,
 
    // The core decides whether a closed bar is new; the indicator only decides when to
    // repaint. OnCalculate fires per tick, so a cheap guard saves a full redraw.
-   datetime cur = time[rates_total - 1];
+   //
+   // The forming bar's open time is read with iTime() rather than from time[]: the
+   // OnCalculate arrays follow the chart's own series direction, which the user can flip,
+   // while iTime(...,0) is always the current bar. Reading time[rates_total-1] would
+   // silently switch to the OLDEST bar if the chart is set to non-series order, and this
+   // guard would then stop firing on new bars entirely.
+   datetime cur = iTime(_Symbol, (ENUM_TIMEFRAMES)Period(), 0);
+   if(cur == 0)
+      return 0;                          // history not ready
 
    if(cur != g_lastBarTime)
    {

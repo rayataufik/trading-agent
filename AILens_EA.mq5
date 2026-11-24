@@ -2,10 +2,14 @@
 //|  AILens_EA.mq5                                                    |
 //|  AI Agent Lens - signal EA (Telegram).                            |
 //|                                                                   |
-//|  SIGNAL-ONLY by default: it reads the same AILens.mqh core as the |
-//|  indicator and sends a Telegram message when a setup fires.       |
-//|  Order execution is behind a separate switch and OFF by default;  |
-//|  turn it on only after the Strategy Tester run is convincing.     |
+//|  SIGNAL-ONLY: it reads the same AILens.mqh core as the indicator  |
+//|  and sends a Telegram message when a setup fires. It never opens  |
+//|  an order in normal use.                                          |
+//|                                                                   |
+//|  All order-execution code sits behind InpEnableOrders, which is   |
+//|  false by default and is meant to be true ONLY inside the         |
+//|  Strategy Tester. Read the warning on that input before flipping  |
+//|  it: there is no daily-loss or max-positions guard in this file.  |
 //|                                                                   |
 //|  Telegram requires two one-time setups:                           |
 //|   1. @BotFather -> /newbot -> keep the token.                     |
@@ -94,6 +98,10 @@ input double InpRiskUsd          = 50.0;   // fixed dollar risk per trade
 input double InpRewardRisk       = 2.0;    // target as an R multiple for the message
 
 input group "Order execution"
+// DANGER, and the reason this defaults to false: this EA sets a stop-loss and a
+// take-profit per order, but it has NO daily-loss limit, NO max-trades-per-day and
+// NO max-concurrent-positions check. With it on, an unattended chart can keep
+// opening trades all day. Treat it as a Strategy Tester switch, not a live switch.
 input bool   InpEnableOrders     = false;  // OFF: signal-only. Read the notes before enabling.
 input double InpMaxSpreadPoints  = 0;      // refuse entry above this spread (points, 0 = off)
 
@@ -279,10 +287,12 @@ int OnInit()
       Print("AILens_EA: core init failed");
       return INIT_FAILED;
    }
-   // Warmup may legitimately fail right after the terminal starts; OnTick retries.
+   // Warmup may legitimately fail right after the terminal starts, or after a timeframe
+   // change; OnTick/OnTimer retry. Log the real reason, not a guess.
    g_ready = g_core.Warmup(InpHistoryBars);
    if(!g_ready)
-      Print("AILens_EA: warmup pending (not enough history yet), will retry on tick");
+      PrintFormat("AILens_EA: warmup pending on %s %s - %s (will retry)",
+                  _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()), g_core.LastError());
 
    if(InpEnableOrders && !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
       Print("AILens_EA: WARNING - orders enabled but AutoTrading is off");
@@ -296,6 +306,10 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    g_core.Deinit();
+   // OnInit runs again after a timeframe or symbol change, which invalidates everything
+   // the core holds. Clearing the flag here means the next Warmup is not skipped on the
+   // stale assumption that history is already loaded.
+   g_ready = false;
 }
 
 //------------------------------------------------------------------//

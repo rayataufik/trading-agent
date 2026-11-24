@@ -40,18 +40,103 @@ Drag `AILens_Ind` ke chart. Panel muncul di kiri atas dengan:
 
 Garis putus-putus: PDH, PDL, VWAP sesi.
 
+### Kalau panel belum muncul (label oranye "waiting")
+
+Indikator **tidak pernah** gagal-menempel karena riwayat belum siap. Saat pertama kali
+dipasang, atau **setiap kali ganti timeframe**, MT5 membuat ulang seluruh handle
+indikator; sampai MT5 selesai menghitungnya, `CopyBuffer` belum bisa mengisi data. Jadi
+indikator menunggu dan mencoba lagi sendiri — label oranye di kiri atas menunjukkan
+alasannya, misalnya:
+
+```
+XAUUSD.x M15: waiting - chart history 240 bars, need 415
+XAUUSD.x M15: waiting - indicators calculated 180 of 415 bars (chart has 5000)
+```
+
+Dua pesan itu **berbeda masalah**, dan itu disengaja:
+
+| Pesan | Artinya | Yang dilakukan |
+|---|---|---|
+| `chart history ... bars` | MT5 belum mengunduh riwayat chart | tunggu; atau set **Tools → Options → Charts → Max bars in chart = Unlimited**, lalu tutup-buka chart |
+| `indicators calculated ...` | riwayat chart ada, tapi buffer indikator belum selesai dihitung | tunggu beberapa detik |
+
+Kalau angkanya **tidak bergerak** setelah ~30 detik pada pesan `chart history`, riwayat
+broker memang belum terunduh. Buka chart itu, scroll ke belakang sekali untuk memaksa
+unduhan, lalu tunggu.
+
+### Ganti timeframe
+
+Aman. Setiap ganti timeframe, `OnDeinit` melepas semua handle lama (kalau tidak, handle
+bocor dan MT5 punya kuota terbatas), lalu `OnInit` membuat yang baru dan indikator
+menunggu lagi seperti saat pertama dipasang. Ini normal, bukan kerusakan.
+
+## Timeframe: semua didukung, tapi dua hal berubah
+
+Kode **tidak** dikunci ke M15. Indikator dan EA selalu memakai timeframe chart itu
+sendiri (`Period()`), jadi jalan di M1 sampai MN1. Yang tercetak di panel dan di pesan
+Telegram juga mengikuti TF chart — di H1 tertulis `H1`.
+
+Tapi "jalan" tidak sama dengan "sama artinya". Dua hal ini perlu Anda sadari:
+
+### 1. HTF harus di ATAS timeframe chart
+
+`InpHtfTf` default **H4**. Kode hanya memakai HTF kalau lebih tinggi dari TF chart:
+
+```mql5
+if((int)m_cfg.htfTf > (int)m_tf)     // HTF valid hanya kalau di atas chart
+```
+
+| Chart | HTF H4 | Komposisi skor |
+|---|---|---|
+| M1–H1 | valid | 5 faktor, HTF 20 poin |
+| H4 | **tidak valid** | 4 faktor, 20 poin HTF didistribusikan ulang |
+| D1, W1 | **tidak valid** | sama seperti H4 |
+
+Bukan error — `InpHtfUnavailable = "Redistribute"` memang menangani ini. Tapi skornya
+jadi tidak sebanding dengan sinyal M15. Kalau Anda trade H1, set `InpHtfTf = H4`. Kalau
+trade H4, set `InpHtfTf = D1`.
+
+### 2. Angka strategi bersifat "per bar", bukan "per jam"
+
+Sesuai keputusan Anda, satu set angka dipakai di semua TF. Konsekuensinya:
+
+| Parameter | Nilai | Di M15 | Di M5 | Di H1 |
+|---|---|---|---|---|
+| `cooldown_bars` | 6 | 1,5 jam | 30 menit | **6 jam** tanpa setup baru |
+| `atr_pct_len` | 100 | ~25 jam | ~8 jam | **~4 hari** |
+| `max_extension_atr` | 1.5 | 1,5×ATR M15 | ATR M5 lebih kecil → lebih sulit lolos | ATR H1 lebih besar → lebih mudah lolos |
+| warmup minimal | ~321 bar | ~3,3 hari | ~1,1 hari | ~53 hari |
+
+Jadi di H1 Anda akan mendapat **jauh lebih sedikit** sinyal (cooldown 6 jam), dan di M1
+stop 2.0×ATR sangat rawan kena noise + spread. Strategi ini dirancang dan dikalibrasi di
+M15; TF lain akan berperilaku lain, bukan salah, tapi belum teruji.
+
 ## EA
 
 1. **Tools → Options → Expert Advisors**
 2. Centang **Allow WebRequest for listed URL**
 3. Tambahkan persis: `https://api.telegram.org`
 4. Isi input `InpBotToken` dan `InpChatId`
-5. `InpEnableOrders` biarkan **false** dulu
+5. `InpEnableOrders` biarkan **false**
 
 Kalau WebRequest tidak diizinkan, setiap kiriman gagal dengan **error 4014** dan muncul
 di tab Experts. Itu bukan bug.
 
 Default sekarang **signal-only**: EA hanya mengirim pesan, tidak membuka posisi.
+
+### `InpEnableOrders` bukan saklar live
+
+Kalau suatu saat Anda menyalakannya, ketahui persis apa yang **tidak** ada di EA ini:
+
+- tidak ada batas rugi harian
+- tidak ada batas jumlah trade per hari
+- tidak ada batas posisi terbuka bersamaan
+
+Yang ada hanya stop-loss dan take-profit per order, plus filter spread. Artinya chart
+yang dibiarkan terbuka bisa terus membuka posisi sepanjang hari. Karena itu default-nya
+`false`, dan satu-satunya pemakaian yang Saya sarankan adalah **Strategy Tester**.
+`config.yaml` sengaja tidak lagi memuat kunci guardrail, supaya tidak terlihat seperti
+perlindungan yang sebenarnya tidak dijalankan kode.
 
 ## Angka default sudah disamakan dengan `config.yaml`
 
@@ -100,8 +185,9 @@ live.
 ## Urutan yang Saya sarankan
 
 1. Compile ketiganya, laporkan error kalau ada
-2. Pasang indikator di XAUUSD M15, lihat panel masuk akal
+2. Pasang indikator di XAUUSD.x M15, lihat panel masuk akal
 3. Cocokkan beberapa bar dengan `parity_check.py` (toleransi ADX berlaku)
-4. Strategy Tester 1 tahun, lihat jumlah trade dan R rata-rata
-5. Baru isi token Telegram dan jalankan signal-only di demo
-6. Live order hanya setelah langkah 4–5 meyakinkan
+4. Ganti-ganti timeframe, pastikan tidak macet lagi
+5. Strategy Tester 1 tahun di M15, lihat jumlah trade dan R rata-rata
+6. Baru isi token Telegram dan jalankan signal-only di demo
+7. Trade otomatis: **tidak**, sesuai keputusan Anda EA tetap signal-only
