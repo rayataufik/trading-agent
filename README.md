@@ -111,6 +111,47 @@ Jadi di H1 Anda akan mendapat **jauh lebih sedikit** sinyal (cooldown 6 jam), da
 stop 2.0×ATR sangat rawan kena noise + spread. Strategi ini dirancang dan dikalibrasi di
 M15; TF lain akan berperilaku lain, bukan salah, tapi belum teruji.
 
+## Jam sesi dan jam pasar
+
+Dua hal berbeda, jangan dicampur:
+
+| | Apa | Bisa dimatikan? |
+|---|---|---|
+| **Jam sesi** | Asia/London/NY — pilihan Anda mau trading kapan | Ya: `InpUseSessionFilter = false` |
+| **Jam pasar** | Kapan broker benar-benar tutup (weekend, Jumat larut) | **Tidak.** Itu fakta, bukan selera |
+
+Jam pasar **dibaca dari MT5**, bukan ditebak: `SymbolInfoSessionQuote()` per hari. Itu
+penting karena "weekend" bukan selalu Sabtu-Minggu — broker yang buka Minggu malam punya
+hari buka sendiri, dan CFD index tutup Jumat sore.
+
+### Baris log saat dipasang
+
+```
+AILens_Ind: XAUUSD.x M30 | session clock: broker-2h -> UTC (you typed -2h) [auto-detected]; clocks now: broker 11:28, UTC 09:28 (gap +2h)
+AILens_Ind: XAUUSD.x market hours (broker time): Mon-Fri 01:00-23:59
+```
+
+**Baris pertama** menjawab: jam berapa yang dipakai untuk menghitung sesi.
+
+- `broker-2h -> UTC` — jam broker dikurangi 2 jam menjadi UTC. Broker Anda UTC+2.
+- `[auto-detected]` — angka itu **dibaca dari terminal**, bukan dari input. Saat broker
+  pindah ke summer time (UTC+3), angka ini ikut berubah sendiri jadi `-3h`.
+- `[fallback ...]` — terminal tidak bisa dibaca saat itu, jadi dipakai angka yang Anda isi.
+- `[FALLBACK - ... gap looked impossible]` — jarak jam broker dan UTC tidak masuk akal.
+  Penyebabnya hampir selalu **jam atau timezone Windows Anda salah**, bukan broker.
+
+Bagian `clocks now` adalah bukti, bukan klaim: `broker 11:28, UTC 09:28`. Bandingkan
+dengan jam di ponsel Anda. Kalau UTC-nya meleset, jam PC yang salah — dan auto-deteksi
+akan ikut salah, karena `TimeGMT()` mengambil waktu dari PC.
+
+**Baris kedua** adalah jam pasar yang dipakai aturan weekend/Jumat. `Mon-Fri 01:00-23:59`
+artinya tiap hari bursa buka 01:00 dan tutup 23:59 **waktu broker**, dan Sabtu-Minggu
+tidak ada sesi sama sekali. Jeda 23:59–01:00 itu istirahat harian XAUUSD (17:00 New York),
+bukan bug.
+
+Kalau tertulis `<none published - market assumed open>`, simbol itu tidak mempublikasikan
+jamnya; gate tidak memblokir apa pun, dan Anda harus memperhatikan tutup pasar sendiri.
+
 ## EA
 
 1. **Tools → Options → Expert Advisors**
@@ -170,6 +211,47 @@ Tabel arti error lain yang sekarang otomatis dijelaskan EA:
 
 **Jangan bagikan token Anda.** Siapa pun yang memegangnya bisa mengirim pesan sebagai bot
 Anda. Kalau pernah bocor, buka @BotFather → `/mybots` → API Token → **Revoke**.
+
+### Baris "Telegram" di panel
+
+Saat EA dipasang, ia **mengirim satu pesan tes** ke chat id Anda. Itu bukan spam — itu
+satu-satunya bukti jujur bahwa seluruh rantai bekerja: `getMe` cukup untuk memastikan
+token hidup, tapi tidak membuktikan chat id bisa menerima, dan justru chat id itulah
+yang pernah salah.
+
+| Tampilan di panel | Artinya |
+|---|---|
+| `Telegram    connected 11:28` (hijau) | Pesan tes **sampai** — cek Telegram Anda, harusnya ada |
+| `Telegram    FAILED 11:28 - see Experts log` (merah) | Gagal; sebabnya di baris log tepat di atasnya |
+| `Telegram    off (inputs empty)` (abu) | EA jalan tapi Telegram sengaja tidak diisi |
+| `Telegram    no data (EA not attached)` (abu) | EA belum pernah jalan di terminal ini |
+
+Status ini dibawa EA lewat Global Variable terminal, jadi indikator di chart mana pun
+menunjukkan hasil pengiriman terakhir. Berlaku juga untuk sinyal asli: setelah satu setup
+terkirim, jam di baris itu diperbarui.
+
+### Target 1:2, dan dari mana angka 1:3 tadi
+
+Default di kedua file sudah lama benar: `InpT1R = 1.0`, `InpT2R = 2.0` — sesuai mandat
+$50 risiko / $100 target. Angka 1:3 yang Anda lihat bukan dari sini, dua kemungkinannya:
+
+1. **MT5 mengingat input terakhir** per indikator per chart. Indikator yang nempel di
+   chart Anda masih membawa angka lama (1.5 / 3.0) dari sebelum default disamakan.
+   Fix: klik kanan chart → *Indicators List* → pilih AI Lens+ → **Edit** → isi `1.0`
+   dan `2.0`. Atau lepas dan pasang ulang indikatornya, lalu tekan **Reset** di
+   jendela input supaya semua nilai kembali ke default baru.
+2. Dulu pesan Telegram menghitung target dari input terpisah (`InpRewardRisk`). Itu
+   **bug** dan sudah dihapus: target sekarang selalu dibaca dari trade (`t.t2`), jadi
+   panel, pesan Telegram, dan box di chart **tidak mungkin** berbeda lagi.
+
+Baris `Targets` di panel sekarang menunjukkan R-nya juga:
+
+```
+Targets     2705.50 / 2711.00   (1.0 / 2.0 R)
+```
+
+Kalau angka di dalam kurung bukan `1.0 / 2.0 R`, input di chart itu yang salah —
+terlihat langsung di tempat, tidak perlu membongkar setting.
 
 ### `InpEnableOrders` bukan saklar live
 

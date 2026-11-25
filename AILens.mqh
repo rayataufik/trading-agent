@@ -201,6 +201,15 @@ int AILens_MinsSinceOpen(int h, int m, int s)
 // Strategy Tester, where the two are simulated) can report a        //
 // nonsense gap. An implausible result falls back rather than        //
 // silently mis-shifting the sessions.                              //
+// `source` reports WHY the returned number was chosen, in words. There    //
+// are three distinct paths and they need three distinct messages:        //
+//  * "auto"     - the terminal agreed with UTC, offset taken from it      //
+//  * "manual"   - the terminal could not be read at this instant          //
+//  * "implausible" - the terminal claimed a gap no real server has, e.g.  //
+//                   a PC whose clock or timezone is wrong                 //
+// The last two both end with the manual value, but only one of them is a  //
+// fault worth chasing. A boolean could express "not auto" and nothing      //
+// more, which reads as success in the log for both failure cases.         //
 //                                                                  //
 // Limitation: the result is whole hours. A broker on a half-hour    //
 // offset (India UTC+5:30, parts of Australia) rounds to the nearest //
@@ -208,8 +217,10 @@ int AILens_MinsSinceOpen(int h, int m, int s)
 // windows themselves are whole hours, so that is the smallest error //
 // this design can carry; no such broker is in use here.            //
 //------------------------------------------------------------------//
-int AILens_ServerToUtcOffsetHours(const int manualHours)
+int AILens_ServerToUtcOffsetHours(const int manualHours, string &source)
 {
+   source = "manual";
+
    datetime srv = TimeTradeServer();
    datetime utc = TimeGMT();
    if(srv <= 0 || utc <= 0)
@@ -223,10 +234,14 @@ int AILens_ServerToUtcOffsetHours(const int manualHours)
    long k = (diffSec + (diffSec >= 0 ? 1800 : -1800)) / 3600;
 
    // A real server clock is within a day of UTC. Anything else means the PC clock or
-   // its timezone is wrong, so prefer the explicit value the user typed.
+   // its timezone is wrong, so prefer the explicit value the user typed - and say so.
    if(k < -14 || k > 14)
+   {
+      source = "implausible";
       return manualHours;
+   }
 
+   source = "auto";
    return (int)(-k);
 }
 
@@ -245,6 +260,17 @@ string AILens_Hhmm(const int seconds)
 {
    int totalMin = seconds / 60;
    return StringFormat("%02d:%02d", totalMin / 60, totalMin % 60);
+}
+
+// "11:28" for a real timestamp. Used to print the broker clock and the UTC clock side by
+// side, because two timestamps are evidence while a single offset is only a claim.
+string AILens_HhmmAt(const datetime t)
+{
+   if(t <= 0)
+      return "--:--";
+   MqlDateTime d;
+   TimeToStruct(t, d);
+   return StringFormat("%02d:%02d", d.hour, d.min);
 }
 
 string AILens_DayName(const int dow)
@@ -297,10 +323,14 @@ bool AILens_MarketHours(const string symbol, const int dayOfWeek,
       TimeToStruct(from, df);
       TimeToStruct(to,   dt);
 
-      int o = df.hour * 3600 + df.min * 60;
-      int c = dt.hour * 3600 + dt.min * 60;
+      // Seconds are kept, not dropped. A broker that closes at 23:59:59 would otherwise
+      // have its close read as 23:59:00, and the gate would shut one minute early - a
+      // difference too small to notice by watching and just large enough to be blamed on
+      // "signals stopped appearing" much later.
+      int o = df.hour * 3600 + df.min * 60 + df.sec;
+      int c = dt.hour * 3600 + dt.min * 60 + dt.sec;
 
-      // `to` is exclusive; a 00:00 close means "until midnight", not "zero length".
+      // `to` is exclusive; an exact-midnight close means "until midnight", not "zero length".
       if(c == 0 && o > 0)
          c = 86400;
       if(c <= o)                                // runs past midnight
@@ -369,6 +399,7 @@ private:
    string       m_lastError;     // why the last load failed; "" when it succeeded
    uint         m_lastLoadAttempt; // GetTickCount() of the last LoadSeries attempt
    int          m_tzOffsetUsed;  // effective broker->UTC hours, resolved once in Init
+   string       m_tzSource;      // why that number was chosen: auto | manual | implausible
 
    // Session gate, resolved once per Init so the "filter off" decision lives in one place
    // instead of being re-derived inside the per-bar path.
@@ -443,6 +474,13 @@ public:
    // Logged at startup so a shifted session can never be silent.
    int               TzOffsetUsed(void) const { return m_tzOffsetUsed; }
    int               TzOffsetRequested(void) const { return m_cfg.sesTzOffsetHours; }
+   // "auto" | "manual" | "implausible" - see AILens_ServerToUtcOffsetHours(). The callers
+   // print this verbatim so the two fallback paths cannot be mistaken for detection.
+   string            TzOffsetSource(void) const { return m_tzSource; }
+   // One ready-made line describing the clock situation, built here so the indicator and
+   // the EA cannot report it differently. Includes both clocks next to the offset: the
+   // offset alone is a claim, the two timestamps are the evidence for it.
+   string            SessionClockReport(void) const;
    // Market calendar actually read from the broker, for the startup log. Empty when the
    // symbol publishes no hours, which is itself worth seeing.
    string            MarketHoursSummary(void) const;
@@ -470,6 +508,7 @@ CAILensCore::CAILensCore(void)
    // 0 until Init() resolves it. A constructor runs before the terminal is guaranteed to be
    // available, so TimeTradeServer()/TimeGMT() are not trustworthy here.
    m_tzOffsetUsed = 0;
+   m_tzSource     = "manual";
    // Same reasoning: the market-hours lookup needs a live terminal, so resolve in Init().
    m_gateUseSessions  = true;
    m_gateSesBufferMin = 15;
@@ -555,7 +594,7 @@ bool CAILensCore::Init(const SAILensConfig &cfg, const string symbol,
    // in every SessionOk call. Two reasons: TimeTradeServer() only means anything while the
    // terminal is up (a global object can be constructed earlier), and recomputing it on
    // every bar in the tester would be pointless work for a value that changes twice a year.
-   m_tzOffsetUsed = AILens_ServerToUtcOffsetHours(m_cfg.sesTzOffsetHours);
+   m_tzOffsetUsed = AILens_ServerToUtcOffsetHours(m_cfg.sesTzOffsetHours, m_tzSource);
 
    // Resolve the session gate here, where the symbol is known and the terminal is up.
    // It needs the broker's published market hours, which are unavailable at construction.
@@ -1909,6 +1948,57 @@ string CAILensCore::MarketHoursSummary(void) const
       return "<published but empty - gate will block>";
 
    return out;
+}
+
+//------------------------------------------------------------------//
+// One line describing the clock the session gate will use.          //
+//                                                                  //
+// This exists because "broker-2h -> UTC [auto-detected]" is not     //
+// enough on its own. An offset is a claim; the two timestamps are   //
+// the evidence. If the used offset differs from the one you typed   //
+// for no seasonal reason, the most likely cause is not the broker - //
+// it is a Windows clock or timezone that is wrong, and TimeGMT()    //
+// inherits that error. Printing broker time and UTC side by side    //
+// makes that visible: subtract them and you have the real gap,      //
+// regardless of what this machine believes UTC is.                  //
+//                                                                  //
+// The three sources read differently on purpose:                    //
+//   auto        - the terminal's clock agreed with UTC              //
+//   manual      - no terminal clock at this instant (or tester)     //
+//   implausible - the gap was impossible, so the typed value was     //
+//                 used; your PC clock is suspect                    //
+//------------------------------------------------------------------//
+string CAILensCore::SessionClockReport(void) const
+{
+   string note;
+   if(m_tzSource == "auto")
+      note = "auto-detected";
+   else if(m_tzSource == "implausible")
+      note = "FALLBACK - server/PC clock gap looked impossible; check the Windows clock";
+   else
+      note = "fallback (terminal clock unavailable here)";
+
+   // Show the gap as well as the two clocks. Two timestamps already contain it, but
+   // asking the reader to subtract is asking for a mistake at 7am; the arithmetic is here
+   // and free. When either clock is unreadable the gap is meaningless, so it is omitted
+   // rather than printed as a lie.
+   datetime srv = TimeTradeServer();
+   datetime utc = TimeGMT();
+   string gap = "";
+   if(srv > 0 && utc > 0)
+   {
+      long g = ((long)srv - (long)utc + ((long)srv >= (long)utc ? 1800 : -1800)) / 3600;
+      gap = StringFormat(" (gap %sh)", AILens_SignedHours((int)g));
+   }
+
+   return StringFormat("session clock: broker%sh -> UTC (you typed %sh) [%s]; "
+                       "clocks now: broker %s, UTC %s%s",
+                       AILens_SignedHours(m_tzOffsetUsed),
+                       AILens_SignedHours(m_cfg.sesTzOffsetHours),
+                       note,
+                       AILens_HhmmAt(srv),
+                       AILens_HhmmAt(utc),
+                       gap);
 }
 
 #endif // __AILENS_MQH__

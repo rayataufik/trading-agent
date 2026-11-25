@@ -100,7 +100,10 @@ input int    InpHistoryBars      = 4000;   // warmup depth
 
 input group "Sizing (used in the message, and for orders if enabled)"
 input double InpRiskUsd          = 50.0;   // fixed dollar risk per trade
-input double InpRewardRisk       = 2.0;    // target as an R multiple for the message
+// There used to be a separate InpRewardRisk here. It recomputed the Telegram target while
+// the chart used InpT2R - two knobs for one price, and they disagreed (2R on the panel,
+// 3R in the message). The target is now read from the trade, so InpT2R above is the only
+// place that decides it.
 
 input group "Order execution"
 // DANGER, and the reason this defaults to false: this EA sets a stop-loss and a
@@ -119,6 +122,13 @@ SAILensConfig g_cfg;
 // Forward declaration: OnTick uses this, but it is defined at the bottom of the file.
 void PlaceBracketOrder(void);
 bool     g_ready = false;
+
+// The indicator reads these globals to render its Telegram row, so the names are shared
+// and declared before their first use. TgSetStatus is forward-declared because TgSend
+// (which reports every attempt) appears before the definition at the bottom.
+#define TG_GV_STATUS  "AILens_TG_Status"
+#define TG_GV_TIME    "AILens_TG_Time"
+void TgSetStatus(const int code);
 
 //==================================================================//
 SAILensConfig BuildConfig(void)
@@ -250,6 +260,48 @@ void TgConfigCheck(void)
                   InpChatId);
 }
 
+//==================================================================//
+//  Telegram CONNECTED test, run once at attach.                    //
+//                                                                  //
+// The config check above catches wrong SHAPES of input; it cannot    //
+// catch a revoked token, or a chat id that never pressed Start.      //
+// Those used to surface only at the first real signal - hours later  //
+// - and then looked like a code bug.                                 //
+//                                                                  //
+// So one real message is sent now. getMe would be quieter, but it    //
+// only proves the TOKEN is alive: it says nothing about whether the  //
+// chat id can receive, which is the half that actually failed here.  //
+// A message that arrives in your Telegram is the only proof that the //
+// whole chain works, and it doubles as the confirmation you asked    //
+// for. It goes through the same TgSend the signals use, so the test  //
+// cannot pass while real sends fail.                                //
+//==================================================================//
+void TgConnectCheck(void)
+{
+   // The Strategy Tester has no network: WebRequest fails there by design, so a test
+   // message would report a failure that is not a failure and print it on every run.
+   if((bool)MQLInfoInteger(MQL_TESTER))
+      return;
+
+   if(InpBotToken == "" || InpChatId == "")
+   {
+      // A deliberate choice, not a fault: report it as "off" rather than "no data", so
+      // the panel does not look like the EA failed to start.
+      TgSetStatus(0);
+      return;                              // already reported by TgConfigCheck
+   }
+
+   string msg = "AI Agent Lens connected\n"
+                + _Symbol + " " + AILens_TfToString((ENUM_TIMEFRAMES)Period()) + "\n"
+                + "Signal-only mode. Setups will arrive in this chat.";
+
+   if(TgSend(msg))
+      Print("AILens_EA: Telegram connected - test message delivered to chat ", InpChatId);
+   else
+      Print("AILens_EA: Telegram NOT connected - the test message was not delivered. "
+            "The reason is the line above it.");
+}
+
 // Telegram's error JSON is accurate but cryptic, and the common failures are all
 // configuration mistakes rather than code faults. Turning the code into a sentence
 // saves a round trip through a browser to look up what "403" meant here.
@@ -311,6 +363,7 @@ bool TgSend(const string textIn)
    {
       Print("AILens_EA: WebRequest failed, err=", GetLastError(),
             " - add https://api.telegram.org to the allowed WebRequest URLs");
+      TgSetStatus(-1);
       return false;
    }
    if(code != 200)
@@ -318,9 +371,29 @@ bool TgSend(const string textIn)
       string body = CharArrayToString(result);
       Print("AILens_EA: telegram HTTP ", code, " resp=", body);
       Print("AILens_EA: cause: ", TgHint(code, body));
+      TgSetStatus(-1);
       return false;
    }
+   TgSetStatus(1);
    return true;
+}
+
+//==================================================================//
+//  TELEGRAM STATUS, shared with the indicator                      //
+//==================================================================//
+// The panel is drawn by the INDICATOR, but Telegram is sent by the EA. They are
+// separate programs with separate globals, so the only channel between them that
+// survives independently is a terminal Global Variable. The indicator reads it and
+// renders one panel row; the EA writes it after every attempt. Without this bridge,
+// "is the bot actually connected?" could only be answered by reading the Experts log.
+//
+// MT5 global variables hold doubles only. The status code and the time fit fine; the
+// human note does not, so it stays in the Experts log where it is already printed in
+// full. The panel needs only state + time.
+void TgSetStatus(const int code)
+{
+   GlobalVariableSet(TG_GV_STATUS, (double)code);
+   GlobalVariableSet(TG_GV_TIME,   (double)TimeCurrent());
 }
 
 //==================================================================//
@@ -340,15 +413,17 @@ void SendSetupMessage(void)
 
    string arrow  = (t.side == 1 ? "\x2714 BUY " : "\x2716 SELL ");
    string side   = (t.side == 1 ? "LONG" : "SHORT");
-   double target = (t.side == 1
-                    ? t.entry + InpRewardRisk * MathAbs(t.entry - t.stop)
-                    : t.entry - InpRewardRisk * MathAbs(t.entry - t.stop));
+   // The target MUST come from the trade itself (t.t2), not from a separate RR input.
+   // It used to recompute the target from InpRewardRisk, a second number that looked
+   // like the same thing. Two sources for one price is one disagreement waiting to
+   // happen - and it happened: the panel showed T2 at 2R while Telegram said 3R.
+   double target = t.t2;
 
    string msg = arrow + side + "  " + _Symbol + "  " + AILens_TfToString((ENUM_TIMEFRAMES)Period()) + "\n"
               + "Score      " + IntegerToString(t.side == 1 ? o.longScore : o.shortScore) + "\n"
               + "Entry      " + DoubleToString(t.entry, _Digits) + "\n"
               + "Stop       " + DoubleToString(t.stop, _Digits) + "\n"
-              + "Target     " + DoubleToString(target, _Digits) + " (" + DoubleToString(InpRewardRisk, 1) + "R)\n"
+              + "Target     " + DoubleToString(target, _Digits) + " (" + DoubleToString(InpT2R, 1) + "R)\n"
               + "Lots       " + DoubleToString(lots, 2) + "   risk ~$" + DoubleToString(riskUsd, 2) + "\n"
               + "Regime     " + o.regime + "\n"
               + "Session    " + o.sesLabel + "\n"
@@ -405,12 +480,11 @@ int OnInit()
       Print("AILens_EA: WARNING - orders enabled but AutoTrading is off");
 
    // Session clock, logged once. A broker on summer time changes this on its own; if it
-   // reports the fallback while you know the server is UTC+2, the PC clock is wrong.
-   PrintFormat("AILens_EA: %s %s | session clock: broker%sh -> UTC (requested %sh)%s",
+   // shows a fallback while you know the server is UTC+2, the PC clock is wrong. The line
+   // is built by the core so the indicator and the EA cannot disagree about it.
+   PrintFormat("AILens_EA: %s %s | %s",
                _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
-               AILens_SignedHours(g_core.TzOffsetUsed()),
-               AILens_SignedHours(g_core.TzOffsetRequested()),
-               (g_core.TzOffsetUsed() == g_core.TzOffsetRequested() ? "" : " [auto-detected]"));
+               g_core.SessionClockReport());
 
    // Broker market hours the weekend/Friday rule is built from.
    string mh = g_core.MarketHoursSummary();
@@ -419,8 +493,10 @@ int OnInit()
 
    EventSetTimer(30);          // heartbeat: re-try warmup / re-check the feed
 
-   // Validate the Telegram inputs now, not at the first setup hours from now.
+   // Validate the Telegram inputs now, not at the first setup hours from now, then send
+   // one real test message - the only honest proof that the whole chain works.
    TgConfigCheck();
+   TgConnectCheck();
 
    return INIT_SUCCEEDED;
 }

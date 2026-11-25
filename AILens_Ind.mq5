@@ -101,6 +101,7 @@ SAILensConfig g_cfg;
 bool g_ready = false;
 datetime g_lastBarTime = 0;
 uint     g_lastAttempt = 0;   // GetTickCount() of the last retry (real time, not server time)
+double   g_tgSeen = -999;     // last Telegram status drawn, so a change repaints the row
 
 // object name prefix, so removal can never touch the user's own objects
 #define PFX "AIL_"
@@ -329,10 +330,52 @@ void DrawPanel(void)
    int    sz[16], slots[16];
    int    n = 0;
 
+   // Telegram status for this terminal, written by the EA. Absent = the EA never ran or
+   // never attempted a send, which is different from "failed" and must not read as one.
+   int      tgCode = 0;
+   datetime tgWhen = 0;
+   bool tgKnown = (GlobalVariableCheck("AILens_TG_Status") &&
+                   GlobalVariableCheck("AILens_TG_Time"));
+   if(tgKnown)
+   {
+      tgCode = (int)GlobalVariableGet("AILens_TG_Status");
+      tgWhen = (datetime)GlobalVariableGet("AILens_TG_Time");
+   }
+
    nm[n]=PFX "p_title";  tx[n]="AI AGENT LENS +  " + _Symbol + " " + TfStr((ENUM_TIMEFRAMES)Period()); cl[n]=cCy;  sz[n]=9;  slots[n]=1; n++;
    nm[n]=PFX "p_hero";   tx[n]=lead + "   " + IntegerToString(t.side == 1 ? o.longScore : (t.side == -1 ? o.shortScore : 0)); cl[n]=leadC; sz[n]=12; slots[n]=2; n++;
    nm[n]=PFX "p_regime"; tx[n]="Regime      " + o.regime;                             cl[n]=cVal;  sz[n]=8; slots[n]=1; n++;
    nm[n]=PFX "p_sess";   tx[n]="Session     " + o.sesLabel + (o.inSession ? "" : " (blocked)"); cl[n]=(o.inSession ? cCy : cWarn); sz[n]=8; slots[n]=1; n++;
+
+   // Telegram row. Written by the EA, read here: the panel is the indicator, the sender is
+   // the EA, and they are separate programs. Four states, because they need four different
+   // fixes: turn Telegram on, attach the EA, fix the credentials, or nothing.
+   {
+      string tgTxt;  color tgClr;
+      if(!tgKnown)                       // no EA has ever written here
+      {
+         tgTxt = "no data (EA not attached)";
+         tgClr = cVal;
+      }
+      else if(tgCode == 0)               // EA ran with the inputs deliberately empty
+      {
+         tgTxt = "off (inputs empty)";
+         tgClr = cVal;
+      }
+      else if(tgCode > 0)
+      {
+         MqlDateTime td;  TimeToStruct(tgWhen, td);
+         tgTxt = StringFormat("connected %02d:%02d", td.hour, td.min);
+         tgClr = cBull;
+      }
+      else
+      {
+         MqlDateTime td;  TimeToStruct(tgWhen, td);
+         tgTxt = StringFormat("FAILED %02d:%02d - see Experts log", td.hour, td.min);
+         tgClr = cBear;
+      }
+      nm[n]=PFX "p_tg";  tx[n]="Telegram    " + tgTxt; cl[n]=tgClr; sz[n]=8; slots[n]=1; n++;
+   }
    nm[n]=PFX "p_scores"; tx[n]="Long/Short  " + IntegerToString(o.longScore) + " / " + IntegerToString(o.shortScore);
                          cl[n]=(o.longScore > o.shortScore ? cBull : (o.shortScore > o.longScore ? cBear : cVal)); sz[n]=8; slots[n]=1; n++;
 
@@ -351,7 +394,17 @@ void DrawPanel(void)
    {
       nm[n]=PFX "p_entry"; tx[n]="Entry       " + DoubleToString(t.entry, _Digits); cl[n]=cVal; sz[n]=8; slots[n]=1; n++;
       nm[n]=PFX "p_stop";  tx[n]="Stop        " + DoubleToString(t.stop, _Digits) + (t.beMoved ? "  (BE)" : ""); cl[n]=cBear; sz[n]=8; slots[n]=1; n++;
-      nm[n]=PFX "p_tgts";  tx[n]="Targets     " + DoubleToString(t.t1, _Digits) + " / " + DoubleToString(t.t2, _Digits); cl[n]=cBull; sz[n]=8; slots[n]=1; n++;
+      // Risk:Reward is derived, not entered: T1 and T2 are R multiples of the same risk
+      // distance the stop sets. Printing the multiples beside the prices makes a wrong
+      // input visible (1.5/3.0 instead of 1.0/2.0 shows up as "1.5 / 3.0 R" here)
+      // without adding another number you must keep in sync.
+      string rrTxt = (t.risk > 0.0
+                      ? StringFormat("%.1f / %.1f R", MathAbs(t.t1 - t.entry) / t.risk,
+                                     MathAbs(t.t2 - t.entry) / t.risk)
+                      : "");
+      nm[n]=PFX "p_tgts";  tx[n]="Targets     " + DoubleToString(t.t1, _Digits) + " / " + DoubleToString(t.t2, _Digits)
+                             + (rrTxt == "" ? "" : "   (" + rrTxt + ")");
+                             cl[n]=cBull; sz[n]=8; slots[n]=1; n++;
       string rTxt = (o.openR == EMPTY_VALUE ? "n/a" : (o.openR >= 0 ? "+" : "") + DoubleToString(o.openR, 2) + "R");
       nm[n]=PFX "p_openr"; tx[n]="Open P&L    " + rTxt; cl[n]=(o.openR >= 0 ? cBull : cBear); sz[n]=8; slots[n]=1; n++;
    }
@@ -496,14 +549,13 @@ int OnInit()
 
    IndicatorSetString(INDICATOR_SHORTNAME, "AI Lens+");
 
-   // Print the session clock once, so a shifted session can never be silent. If the broker
-   // switches to summer time, "used" changes with it and this line changes too; if it
-   // shows the fallback while the server is known to be UTC+2, the PC clock is wrong.
-   PrintFormat("AILens_Ind: %s %s | session clock: broker%sh -> UTC (requested %sh)%s",
+   // Print the session clock once, so a shifted session can never be silent. The line comes
+   // from the core, so the indicator and the EA always say the same thing. It includes
+   // broker time and UTC side by side: if the two clocks disagree by more than you expect,
+   // the problem is this PC's clock or timezone, not the broker.
+   PrintFormat("AILens_Ind: %s %s | %s",
                _Symbol, AILens_TfToString((ENUM_TIMEFRAMES)Period()),
-               AILens_SignedHours(g_core.TzOffsetUsed()),
-               AILens_SignedHours(g_core.TzOffsetRequested()),
-               (g_core.TzOffsetUsed() == g_core.TzOffsetRequested() ? "" : " [auto-detected]"));
+               g_core.SessionClockReport());
 
    // Market hours the gate will actually use, straight from the broker. Printed so the
    // automatic weekend/Friday rule can be checked rather than trusted: if this reads
@@ -638,7 +690,16 @@ void OnTimer(void)
    bool panelMissing = (ObjectFind(0, PFX "p_title") < 0);
    bool advanced = g_core.Step();          // true only when a NEW bar was processed
 
-   if(!panelMissing && !advanced)
+   // The Telegram row is written by the EA, on the EA's schedule, not on bar closes.
+   // Repaint when its status changes so a connect (or a failure) reaches the panel
+   // within one timer tick instead of waiting for the next bar.
+   double tgNow = (GlobalVariableCheck("AILens_TG_Status")
+                   ? GlobalVariableGet("AILens_TG_Status") : -999);
+   bool tgChanged = (tgNow != g_tgSeen);
+   if(tgChanged)
+      g_tgSeen = tgNow;
+
+   if(!panelMissing && !advanced && !tgChanged)
       return;
 
    DrawAll();
