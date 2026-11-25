@@ -201,10 +201,89 @@ double LotsFor(const double entry, const double stop)
 //==================================================================//
 //  TELEGRAM                                                        //
 //==================================================================//
+// Startup sanity check for the two Telegram inputs. A wrong chat id used to stay silent
+// until the first setup, which can be hours away, and the failure then looked like a code
+// bug. Checking once at attach turns "why is nothing arriving" into a line in the log.
+void TgConfigCheck(void)
+{
+   if(InpBotToken == "" && InpChatId == "")
+   {
+      Print("AILens_EA: Telegram not configured (both inputs empty) - this EA is a "
+            "terminal-only indicator right now.");
+      return;
+   }
+   if(InpBotToken == "")
+   {
+      Print("AILens_EA: InpBotToken is empty - nothing can be sent. Paste the token from "
+            "@BotFather into the field that reads 'from @BotFather'.");
+      return;
+   }
+   if(StringFind(InpBotToken, ":") < 0)
+      Print("AILens_EA: InpBotToken has no ':' - a real token looks like "
+            "123456789:AA.... Copy it again from @BotFather.");
+   if(InpChatId == "")
+   {
+      Print("AILens_EA: InpChatId is empty - nothing can be sent. See the README for how "
+            "to get your numeric chat id.");
+      return;
+   }
+   if(StringFind(InpChatId, ":") >= 0)
+   {
+      Print("AILens_EA: InpChatId looks like a BOT TOKEN. It must be your numeric chat id. "
+            "Fix: read getUpdates, or message @userinfobot, and use the number it gives.");
+      return;
+   }
+
+   // Telegram chat ids are numeric, negative for groups and channels.
+   int len = StringLen(InpChatId);
+   int start = (StringGetCharacter(InpChatId, 0) == '-') ? 1 : 0;
+   bool numeric = (len > start);
+   for(int i = start; i < len && numeric; i++)
+   {
+      ushort ch = StringGetCharacter(InpChatId, i);
+      if(ch < '0' || ch > '9')
+         numeric = false;
+   }
+   if(!numeric)
+      PrintFormat("AILens_EA: InpChatId \"%s\" is not a plain number. Telegram will reject "
+                  "it; the id is digits only, optionally with a leading '-'.",
+                  InpChatId);
+}
+
+// Telegram's error JSON is accurate but cryptic, and the common failures are all
+// configuration mistakes rather than code faults. Turning the code into a sentence
+// saves a round trip through a browser to look up what "403" meant here.
+string TgHint(const int code, const string body)
+{
+   if(StringFind(body, "can't send messages to the bot") >= 0)
+      return "chat_id is a BOT, not you. The number before the ':' in your token is the "
+             "bot's own id - do not use it. Get YOUR id from getUpdates or @userinfobot.";
+   if(StringFind(body, "chat not found") >= 0)
+      return "chat_id is wrong, or you never sent /start to the bot. Open the bot in "
+             "Telegram, press Start, then read getUpdates again.";
+   if(StringFind(body, "Unauthorized") >= 0 || code == 401)
+      return "the bot token is wrong or was revoked. Copy it again from @BotFather.";
+   if(StringFind(body, "not enough rights") >= 0)
+      return "the bot lacks permission to post in that chat (channel/group admin rights).";
+   if(StringFind(body, "bot was blocked by the user") >= 0)
+      return "you blocked the bot. Unblock it in Telegram, then send /start again.";
+   return "see https://core.telegram.org/bots/api#responseparameters";
+}
+
 bool TgSend(const string textIn)
 {
    if(InpBotToken == "" || InpChatId == "")
       return false;                       // not configured: silently skip
+
+   // A token is "<bot_id>:<secret>" - one colon, nothing else. Catching a pasted token in
+   // the chat_id field here is worth the two lines: it is the single most common mistake,
+   // and it fails in a way ("403 bot can't message a bot") that reads like a code bug.
+   if(StringFind(InpChatId, ":") >= 0)
+   {
+      Print("AILens_EA: InpChatId looks like a BOT TOKEN, not a chat id. The chat id is a "
+            "plain number (may start with '-'). Sending will fail until this is fixed.");
+      return false;
+   }
 
    // StringReplace works in place, so it needs a mutable copy - and the escapes must
    // be applied in an order that cannot re-escape its own output ("+" -> %2B before
@@ -236,7 +315,9 @@ bool TgSend(const string textIn)
    }
    if(code != 200)
    {
-      Print("AILens_EA: telegram HTTP ", code, " resp=", CharArrayToString(result));
+      string body = CharArrayToString(result);
+      Print("AILens_EA: telegram HTTP ", code, " resp=", body);
+      Print("AILens_EA: cause: ", TgHint(code, body));
       return false;
    }
    return true;
@@ -275,9 +356,30 @@ void SendSetupMessage(void)
               + "Structure  " + o.structBias;
 
    TgSend(msg);
+
+   // Log the sizing arithmetic, not just the result. "lots=0.01" cannot be told apart
+   // from "lots was floored at the minimum" without the stop distance and the contract
+   // values, and those are exactly the broker-specific numbers most likely to be wrong.
+   // One line here answers it; otherwise it means a trip into the Specification window.
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double stopDist  = MathAbs(t.entry - t.stop);
+   double riskPerLot = (tickSize > 0.0 ? stopDist / tickSize * tickValue : 0.0);
+
    Print("AILens_EA: ", side, " setup on ", _Symbol,
           " score=", (t.side == 1 ? o.longScore : o.shortScore),
           " lots=", DoubleToString(lots, 2));
+   PrintFormat("AILens_EA:   sizing: stopDist=%s tickSize=%s tickValue=%s "
+               "riskPerLot=%s requested=$%s -> lots=%s%s",
+               DoubleToString(stopDist, _Digits),
+               DoubleToString(tickSize, 8),
+               DoubleToString(tickValue, 2),
+               DoubleToString(riskPerLot, 2),
+               DoubleToString(InpRiskUsd, 2),
+               DoubleToString(lots, 2),
+               (lots <= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) + 1e-9
+                ? "  [FLOORED AT MIN LOT - risk may exceed the target]"
+                : ""));
 }
 
 //==================================================================//
@@ -316,6 +418,10 @@ int OnInit()
                _Symbol, (mh == "" ? "<none published - market assumed open>" : mh));
 
    EventSetTimer(30);          // heartbeat: re-try warmup / re-check the feed
+
+   // Validate the Telegram inputs now, not at the first setup hours from now.
+   TgConfigCheck();
+
    return INIT_SUCCEEDED;
 }
 

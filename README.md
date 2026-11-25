@@ -124,6 +124,53 @@ di tab Experts. Itu bukan bug.
 
 Default sekarang **signal-only**: EA hanya mengirim pesan, tidak membuka posisi.
 
+### Dua input Telegram, dan kenapa namanya tidak terlihat
+
+Di panel input, **komentar menggantikan nama variabel**. Jadi yang Anda lihat adalah:
+
+| Yang tampil di panel | Variabel sebenarnya | Isi dengan |
+|---|---|---|
+| `from @BotFather; leave empty to disable sending` | `InpBotToken` | token bot |
+| `your chat id` | `InpChatId` | **angka**, bukan token |
+
+Token selalu berbentuk `123456789:AA...` — ada titik dua di tengah. Angka sebelum titik dua
+itu **ID bot itu sendiri**, dan bukan chat id Anda. Salah menaruh token di kolom chat id
+menghasilkan error yang menyesatkan:
+
+```
+403 Forbidden: the bot can't send messages to the bot
+```
+
+Artinya bot disuruh mengirim pesan ke dirinya sendiri. EA sekarang menangkap ini saat
+dipasang dan menulis sebabnya di tab Experts, jadi tidak perlu menunggu sinyal pertama.
+
+### Cara mendapatkan chat id
+
+1. Buka bot Anda di Telegram, tekan **Start**, kirim pesan apa saja
+2. Buka di browser:
+
+```
+https://api.telegram.org/bot<TARUH_TOKEN>/getUpdates
+```
+
+3. Cari `"chat":{"id":...}` — itulah chat id. Kalau kosong, kirim pesan lagi lalu refresh.
+4. Alternatif cepat: kirim pesan ke **@userinfobot**, dia membalas id Anda.
+5. Untuk grup/channel, id-nya **negatif** (mis. `-1001234567890`). Tanda minusnya bagian
+   dari id, jangan dihapus.
+
+Tabel arti error lain yang sekarang otomatis dijelaskan EA:
+
+| Pesan Telegram | Sebabnya |
+|---|---|
+| `403 ... can't send messages to the bot` | chat id diisi id bot, bukan id Anda |
+| `400 ... chat not found` | chat id salah, atau Anda belum pernah `/start` ke bot |
+| `401 Unauthorized` | token salah atau sudah di-revoke |
+| `403 ... not enough rights` | bot tidak punya izin posting di channel/grup itu |
+| `403 ... bot was blocked by the user` | Anda memblokir bot; buka blokir lalu `/start` |
+
+**Jangan bagikan token Anda.** Siapa pun yang memegangnya bisa mengirim pesan sebagai bot
+Anda. Kalau pernah bocor, buka @BotFather → `/mybots` → API Token → **Revoke**.
+
 ### `InpEnableOrders` bukan saklar live
 
 Kalau suatu saat Anda menyalakannya, ketahui persis apa yang **tidak** ada di EA ini:
